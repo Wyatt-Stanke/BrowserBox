@@ -202,7 +202,7 @@ jobs:
           });
 
     - name: Keep alive
-      run: sleep 480
+      run: sleep 4800
 
     - name: Close issue
       uses: actions/github-script@v6
