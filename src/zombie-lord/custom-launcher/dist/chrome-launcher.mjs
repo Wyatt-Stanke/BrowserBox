@@ -55,6 +55,7 @@ export async function launch(opts = {}) {
       process.on(_SIGINT, sigintListener);
     }
     instances.add(instance);
+    console.log('Launching chrome...');
     yield instance.launch();
     /* eslint-disable require-yield */
     const kill = () => __awaiter(this, void 0, void 0, function* () {
@@ -155,6 +156,7 @@ export default class Launcher {
       this.port = this.requestedPort;
       // If an explict port is passed first look for an open connection...
       try {
+        console.log(`Try debugger...`);
         return await this.isDebuggerReady();
       }
       catch (err) {
@@ -171,10 +173,13 @@ export default class Launcher {
     if (!this.tmpDirandPidFileReady) {
       this.prepare();
     }
+    console.log(`Chrome path: ${this.chromePath}`);
     this.pid = await this.spawnProcess(this.chromePath);
   }
   async spawnProcess(execPath) {
+    console.log('HELLO???');
     const {DEBUG, CONFIG} = await import("../../../common.js");
+    console.log('2222 HELLO???');
     if (this.chrome) {
       log.log('ChromeLauncher', `Chrome already running with pid ${this.chrome.pid}.`);
       return this.chrome.pid;
@@ -187,17 +192,24 @@ export default class Launcher {
       this.port = await random_port_1.getRandomPort();
     }
     log.verbose('ChromeLauncher', `Launching with command:\n"${execPath}" ${this.flags.join(' ')}`);
-    const script = `#!/bin/bash
-    exec ${process.env.BB_POOL ? 'sudo -g browsers ' : ''}"${execPath}" ${this.flags.join(' ')}
-    `
-    console.log({script});
-    const scriptPath = path.resolve(CONFIG.baseDir, 'scripts', 'startc.sh'); 
-    fs.mkdirSync(path.dirname(scriptPath), {recursive: true});
-    fs.writeFileSync(scriptPath, script);
-    fs.chmodSync(scriptPath, 0o777);
-    const chrome = this.spawn(scriptPath, { detached: true, stdio: DEBUG.val ? 'inherit' : ['ignore', this.outFile, this.errFile], env: this.envVars });
+    let chrome;
+    if ( process.platform == 'win32' ) {
+      chrome = this.spawn(execPath, this.flags, { detached: true, stdio: DEBUG.val ? 'inherit' : ['ignore', this.outFile, this.errFile], env: this.envVars });
+    } else {
+      const scriptName = `start_bb_browser.sh`;
+      const scriptPath = () => path.resolve(CONFIG.baseDir, 'scripts', scriptName); 
+      fs.mkdirSync(path.dirname(scriptPath()), {recursive: true});
+      const script = `#!/usr/bin/env bash
+      exec ${process.env.BB_POOL ? 'sudo -g browsers ' : ''}"${execPath}" ${this.flags.join(' ')}
+      `
+      console.log({script});
+      fs.writeFileSync(scriptPath(), script);
+      fs.chmodSync(scriptPath(), 0o777);
+      chrome = this.spawn(scriptPath(), { detached: true, stdio: DEBUG.val ? 'inherit' : ['ignore', this.outFile, this.errFile], env: this.envVars });
+    }
     this.chrome = chrome;
     DEBUG.val && console.log(this.chrome);
+
     this.fs.writeFileSync(this.pidFile, chrome.pid.toString());
     log.verbose('ChromeLauncher', `Chrome running with pid ${chrome.pid} on port ${this.port}.`);
     const pid = chrome.pid;
@@ -218,15 +230,61 @@ export default class Launcher {
     const port = parseInt(this.port);
     console.log({port});
     let browser;
+    let err = null;
+    // try localhost
     try {
-      browser = execSync(`curl -s http://localhost:${port}/json/version`);
+      console.info(`Trying to connect to browser on localhost port ${port}`);
+      browser = execSync(`curl -s http://localhost:${port}/json/version`).toString();
+      if ( browser.length == 0 ) {
+        throw new Error(`Browser error`);
+      } 
       console.log('browser', browser.toString());
     } catch(e) {
       DEBUG.val && console.info("Browser error", e);
-      throw e;
+      err = e;
     }
-    DEBUG.val && console.info("Browser OK");
-    return browser;
+    if ( ! err && browser.length > 0 ) {
+      DEBUG.val && console.info("Browser OK");
+      return browser;
+    }
+
+    // try 127.0.0.1
+    err = null;
+    try {
+      console.info(`Trying to connect to browser on 127.0.0.1 port ${port}`);
+      browser = execSync(`curl -s http://127.0.0.1:${port}/json/version`).toString();
+      if ( browser.length == 0 ) {
+        throw new Error(`Browser error`);
+      } 
+      console.log('browser', browser.toString());
+    } catch(e) {
+      DEBUG.val && console.info("Browser error", e);
+      err = e;
+    }
+    if ( ! err && browser.length > 0 ) {
+      DEBUG.val && console.info("Browser OK");
+      return browser;
+    }
+
+    // try ::1
+    err = null;
+    try {
+      console.info(`Trying to connect to browser on ::1 port ${port}`);
+      browser = execSync(`curl -s -6 "http://[::1]:${port}/json/version"`).toString();
+      if ( browser.length == 0 ) {
+        throw new Error(`Browser error`);
+      } 
+      console.log('browser', browser.toString());
+    } catch(e) {
+      DEBUG.val && console.info("Browser error", e);
+      err = e;
+    }
+    if ( ! err && browser.length > 0 ) {
+      DEBUG.val && console.info("Browser OK");
+      return browser;
+    } else {
+      throw new Error(`Browser error`);
+    }
   }
   // resolves when debugger is ready, rejects after 10 polls
   async waitUntilReady() {

@@ -3,7 +3,11 @@
   "optimizers": {
     "*.js": [
       /*"@rbf/parcel-optimizer-javascript-obfuscator", "..."*/
+      /*"@parcel/optimizer-terser"*/
+    ],
+    "*.css": [
+      /*"@parcel/optimizer-cssnano"*/
     ]
   },
-  "resolvers": ["parcel-resolver-ignore", "..."]
+  "resolvers": ["parcel-resolver-ignore", "..."],
 }

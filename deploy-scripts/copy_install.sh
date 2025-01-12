@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
 
 INSTALL_DIR="${1:-$(pwd)}"
-
 SUDO=""
+COMMAND_DIR=""
 
-if command -v sudo; then
-  SUDO="sudo"
+if [[ -f ~/.nvm/nvm.sh ]]; then
+  source ~/.nvm/nvm.sh
+fi
+
+if command -v sudo &> /dev/null; then
+  SUDO="sudo -n"
+fi
+
+# Check if /usr/local/bin is in the PATH and is writable
+if [[ ":$PATH:" == *":/usr/local/bin:"* ]] && sudo test -w /usr/local/bin; then
+  COMMAND_DIR="/usr/local/bin"
+  $SUDO mkdir -p $COMMAND_DIR
+elif sudo test -w /usr/bin; then
+  COMMAND_DIR="/usr/bin"
+  $SUDO mkdir -p $COMMAND_DIR
+else
+  COMMAND_DIR="$HOME/.local/bin"
+  mkdir -p $COMMAND_DIR
+fi
+
+if [[ -f /etc/os-release ]]; then
+  . /etc/os-release
+  if [[ $ID == *"bsd" ]]; then
+    echo "Skipping build step as on a bsd flavor" >&2
+  fi
+else
+  bundle="$(cd src; node -e "import('./common.js').then(({DEBUG}) => console.log(DEBUG.bundleClientCode))")"
+  if [[ "$bundle" != "false" ]]; then
+    npm run parcel
+  fi
 fi
 
 echo "INSTALL_DIR: $INSTALL_DIR"
@@ -24,29 +52,7 @@ $SUDO chmod -R 755 /usr/local/share/dosyago/*
 
 echo "Permissions set!"
 
-echo -n "Copying bbpro command to /usr/local/bin/ ..."
+cd $INSTALL_DIR
 
-$SUDO cp $INSTALL_DIR/deploy-scripts/_bbpro.sh /usr/local/bin/bbpro
+./deploy-scripts/cp_commands_only.sh
 
-echo "Copied!"
-
-echo -n "Copying setup_bbpro command to /usr/local/bin/ ..."
-
-$SUDO cp $INSTALL_DIR/deploy-scripts/_setup_bbpro.sh /usr/local/bin/setup_bbpro
-
-echo "Copied!"
-
-echo -n "Copying monitoring commands to /usr/local/bin/ ..."
-
-$SUDO cp $INSTALL_DIR/monitor-scripts/* /usr/local/bin/
-
-echo "Copied!"
-
-echo -n "Copying sslcerts to /usr/local/share/dosyago/sslcerts ..."
-
-$SUDO mkdir -p /usr/local/share/dosyago/sslcerts/
-$SUDO rm -rf /usr/local/share/dosaygo/sslcerts/*
-$SUDO cp $HOME/sslcerts/* /usr/local/share/dosyago/sslcerts/
-$SUDO chmod -R 755 /usr/local/share/dosyago/sslcerts/*
-
-echo "Copied!"

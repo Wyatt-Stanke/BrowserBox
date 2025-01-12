@@ -1,10 +1,12 @@
 import {DEBUG, logit} from './common.js';
 
 export const getKeyId = event => event.key && event.key.length > 1 ? event.key : event.code;
-export const controlChars = new Set([
+export const controlChars = new Set([]);
+/*
   "Enter", "Backspace", "Control", "Shift", "Alt", "Meta", "Space", "Delete",
   "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Tab"
 ]);
+*/
 
 export default function transformEvent(e, {scale}, bounds) {
   const transformedEvent = {
@@ -26,6 +28,11 @@ export default function transformEvent(e, {scale}, bounds) {
       transformedEvent.originalEvent = originalEvent;
     }
     switch(synthetic.type) {
+      case "actionOnClicked": {
+        const {data} = synthetic;
+        Object.assign(transformedEvent, {data});
+        break;
+      }
       case "favicon": {
         throw new TypeError(`Client can not request favicons from back-end`);
         const {targetId} = synthetic;
@@ -133,8 +140,8 @@ export default function transformEvent(e, {scale}, bounds) {
           ({width:{value:width}, height:{value:height}} = form);
         }
 
-        const {targetId, forceFrame, resetRequested} = synthetic;
-        Object.assign(transformedEvent, {width, height, targetId, resetRequested, forceFrame});
+        const {targetId, mobile, forceFrame, resetRequested} = synthetic;
+        Object.assign(transformedEvent, {width, height, mobile, targetId, resetRequested, forceFrame});
         break;
       }
       case "user-agent": {

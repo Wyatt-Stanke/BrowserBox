@@ -26,6 +26,7 @@
     if ( received || running ) return;
     running = true;
     s({running: "getFaviconElement", targetId});
+    requestReset();
     try {
       const iconURLs = Array.from(
         document.querySelectorAll(
@@ -39,10 +40,20 @@
         urlCopy.pathname = "/favicon.ico";
         urlCopy.search = '';
         urlCopy.hash = '';
-        url = urlCopy + '';
+        iconURLs.push(urlCopy+'');
+        /*
+          urlCopy.pathname = "/favicon.png";
+          iconURLs.push(urlCopy+'');
+          urlCopy.pathname = "/favicon.svg";
+          iconURLs.push(urlCopy+'');
+          urlCopy.pathname = "/favicon.jpg";
+          iconURLs.push(urlCopy+'');
+          urlCopy.pathname = "/favicon.jpeg";
+          iconURLs.push(urlCopy+'');
+          urlCopy.pathname = "/favicon.webp";
+          iconURLs.push(urlCopy+'');
+        */
       }
-
-      iconURLs.push(url);
 
       let hasIcon = false;
       for( const iconURL of iconURLs ) {
@@ -53,11 +64,13 @@
         }
         if ( ! hasIcon ) {
           try {
-            await getIcon(iconURL, {withCredentials: true});
+            hasIcon = await getIcon(iconURL, {withCredentials: true});
           } catch(e) {
             s({getIconWithCredentialsError: e+''});
           }
         }
+        if ( hasIcon ) break;
+        await new Promise(res => setTimeout(res, 300));
       }
     } catch(e) {
       s({e: e+''});
@@ -71,6 +84,10 @@
       Sent.add(o.faviconDataUrl);
     }
     console.log(JSON.stringify({favicon:o}));
+  }
+
+  function requestReset() {
+    console.log(JSON.stringify({resetFavicon:{reset:true, targetId}}));
   }
 
   async function getIcon(iconURL, {withCredentials = false} = {}) {

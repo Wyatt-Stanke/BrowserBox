@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 username=$(whoami)
 echo "Starting viewfinder service cluster as $username"
@@ -38,7 +38,7 @@ sudo -g browsers $node index.js 8001 xxxcookie 9rPiEJACvvcfG &
 BGPID2=$!
 
 echo "Starting chat server"
-cd websocket_chat_app_homework
+cd websocket_chat_app
 sudo -g browsers $node index.js 8004 xxxcookie 9rPiEJACvvcfG&
 BGPID5=$!
 cd ..

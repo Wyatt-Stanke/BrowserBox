@@ -1,6 +1,8 @@
+import os from 'os';
+import {spawn} from 'node:child_process';
 import Connect from './connection.js';
-import {getViewport} from './connection.js';
-import {CONFIG,COMMAND_MAX_WAIT,throwAfter, untilTrue, sleep, throttle, DEBUG} from '../common.js';
+import {workerAllows, getWorker, updateTargetsOnCommonChanged, executeBinding, getViewport} from './connection.js';
+import {LOG_FILE,CONFIG,COMMAND_MAX_WAIT,throwAfter, untilTrue, sleep, throttle, DEBUG} from '../common.js';
 import {MAX_FRAMES, MIN_TIME_BETWEEN_SHOTS, ACK_COUNT, MAX_ROUNDTRIP, MIN_SPOT_ROUNDTRIP, MIN_ROUNDTRIP, BUF_SEND_TIMEOUT, RACE_SAMPLE} from './screenShots.js';
 import fs from 'fs';
 
@@ -19,8 +21,18 @@ const Options = {
 //const TAIL_START = 100;
 //let lastTailShot = false;
 //let lastHash;
-const goLowRes = throttle((connection, ...args) => connection.shrinkImagery(...args), 10000);
-const goHighRes = throttle((connection, ...args) => connection.growImagery(...args), 10000); 
+const tabsOnClose = new Map();
+let BANDWIDTH_ISSUE_STATE = false;
+const goLowRes = throttle((connection, ...args) => connection.shrinkImagery(...args), 8000);
+const goHighRes = throttle((connection, ...args) => connection.growImagery(...args), 8000); 
+const notifyBandwidthIssue = throttle(function (zombie_port, bandwidthIssue) {
+  DEBUG.debugAdaptiveImagery && console.log('Maybe notifying bwissue on ack', {bandwidthIssue});
+  if ( bandwidthIssue != BANDWIDTH_ISSUE_STATE ) {
+    controller_api.notifyBandwidthIssue(zombie_port, {issue: bandwidthIssue});
+    BANDWIDTH_ISSUE_STATE = bandwidthIssue;
+    DEBUG.debugAdaptiveImagery && console.log('Notified BW Issue');
+  }
+}, 1000);
 
 const controller_api = {
   zombieIsDead(port) {
@@ -39,7 +51,7 @@ const controller_api = {
       const meta = [...connection.favicons.entries()].map(([targetId, faviconDataUrl]) => ({favicon:{targetId, faviconDataUrl}}));
       if ( connection.modal ) {
         const {modal} = connection;
-        meta.push({modal});
+        connection.forceMeta({modal});
       }
       DEBUG.debugFaviconsSend && console.log(`Will send favicons`, meta);
       send({meta});
@@ -70,6 +82,9 @@ const controller_api = {
 
   async screenshotAck(connectionId, port, receivedFrameId, channel) {
     const {frameId, castSessionId} = receivedFrameId;
+    if ( frameId === 0 || castSessionId == 3428128028){
+      receivedFrameId.requiresCastId = true; 
+    }
     const connection = connections.get(port);
     let bandwidthIssue = false;
     //DEBUG.debugCast && console.log('Acking', connectionId, port, receivedFrameId);
@@ -79,6 +94,12 @@ const controller_api = {
         throw new TypeError(`No client connected with connectionId ${connectionId}`);
       }
       const {ack} = channels;
+
+      if ( receivedFrameId.requiresCastId ) {
+        receivedFrameId.requiresCastId = undefined;
+        // TODO: update this to ensure correct cast session for target
+        receivedFrameId.castSessionId = connection.latestCastId;
+      }
 
       try {
         ack.received = receivedFrameId;
@@ -108,7 +129,8 @@ const controller_api = {
               }
               if ( frameBuffer ) {
                 Frames.push(...frameBuffer);
-                while ( Frames.length > MAX_FRAMES ) {
+                const mf = MAX_FRAMES();
+                while ( Frames.length > mf ) {
                   Frames.shift();
                 }
               }
@@ -118,7 +140,12 @@ const controller_api = {
               DEBUG.channelDebug && console.log((new Error).stack);
             }
           })
-          //DEBUG.debugCast && console.log("Sent ack");
+          const castInfo = connection.currentCast;
+          if ( castInfo ) {
+            DEBUG.debugAckBlast && console.log(`Setting session has received frame`);
+            castInfo.sessionHasReceivedFrame = true; 
+          }
+          DEBUG.debugCast && console.log("Sent ack");
         }
 
         if ( DEBUG.adaptiveImagery ) {
@@ -135,12 +162,12 @@ const controller_api = {
 
             const avgRoundtrip = ack.timeSum / ack.times.length;
             DEBUG.debugAdaptiveImagery && console.log(`Average roundtrip time: ${avgRoundtrip}ms, actual: ${roundtripTime}ms`);
-            if ( avgRoundtrip > MAX_ROUNDTRIP /*|| roundtripTime > MAX_ROUNDTRIP */ ) {
-              goLowRes(connection);
+            if ( avgRoundtrip > MAX_ROUNDTRIP() /*|| roundtripTime > MAX_ROUNDTRIP() */ ) {
               bandwidthIssue = true;
-            } else if ( avgRoundtrip < MIN_ROUNDTRIP /*|| roundtripTime < MIN_SPOT_ROUNDTRIP */) {
-              goHighRes(connection);
+              goLowRes(connection);
+            } else if ( avgRoundtrip < MIN_ROUNDTRIP() /*|| roundtripTime < MIN_SPOT_ROUNDTRIP() */) {
               bandwidthIssue = false;
+              goHighRes(connection);
             }
           }
         }
@@ -152,7 +179,7 @@ const controller_api = {
           await sleep(10);
 
           while ( ack.count && DEBUG.bufSend && ack.bufSend && ack.buffer.length ) {
-            DEBUG.acks && console.log(`Got ack from ${connectionId} and have buffered unsent frame. Will send now.`);
+            (DEBUG.debugCast || DEBUG.acks) && console.log(`Got ack from ${connectionId} and have buffered unsent frame. Will send now.`);
 
             const {peer, socket, fastest} = channels;
             const channel = DEBUG.chooseFastest && fastest ? fastest : 
@@ -178,7 +205,7 @@ const controller_api = {
               ack.count = 0;
               ack.buffer.length = 0;
             }
-            await sleep(MIN_TIME_BETWEEN_SHOTS);
+            await sleep(MIN_TIME_BETWEEN_SHOTS());
           }
 
           ack.sending = false;
@@ -195,13 +222,13 @@ const controller_api = {
         console.warn('screenshotAck error', e);
         ack.sending = false;
       }
-      return {bandwidthIssue};
+      notifyBandwidthIssue(port, bandwidthIssue);
     } else {
       throw new TypeError(`No connection on port ${port}`);
     }
   },
 
-  async addLink(so, {connectionId, peer, socket, fastest}, port) {
+  async addLink({so, forceMeta}, {connectionId, peer, socket, fastest}, port) {
     await untilTrue(() => connections.has(port), 100, 1000);
     const connection = connections.get(port);
     if ( connection ) {
@@ -255,8 +282,14 @@ const controller_api = {
           console.log("Links keys", ...connection.links.keys());
         }
       }
-      if ( ! connection.so ) {
+      if ( ! connection.so || connection.renewed ) {
         connection.so = so;
+      }
+      if ( ! connection.forceMeta || connection.renewed ) {
+        connection.forceMeta = forceMeta;
+      }
+      if ( connection.renewed ) {
+        connection.renewed = false;
       }
       connection.doShot({forceFrame:true});
     } else {
@@ -271,31 +304,7 @@ const controller_api = {
     if ( connection ) {
       connection.links.delete(connectionId);
       connection.viewports.delete(connectionId);
-      const remainingConnectionId = [...connection.viewports.keys()][0];
-      DEBUG.debugViewportDimensions && console.log('Viewports--', connection.viewports);
-      const viewport = getViewport(...connection.viewports.values());
-      DEBUG.debugViewportDimensions && console.log('Common viewport', viewport);
-      DEBUG.coords && console.log(`Resetting device metrics on client departure`, viewport);
-      this.send({
-        name: "Browser.setWindowBounds",
-        params: {
-          windowId: connection.latestWindowId,
-          bounds: viewport,
-        },
-        requiresWindowId: true,
-        forceFrame: true,
-        receivesFrames: true,
-      }, port);
-      this.send({
-        name: "Emulation.setDeviceMetricsOverride",
-        params: {
-          ...viewport,
-          mobile: viewport.mobile ? viewport.mobile : connection.isMobile,
-        },
-        receivesFrames: true,
-        requiresShot: true,
-        forceFrame: true,
-      }, port);
+      updateTargetsOnCommonChanged({connection, command: "all", force: true});
     } else {
       throw new TypeError(`No connection on port ${port}`);
     }
@@ -314,13 +323,17 @@ const controller_api = {
     Object.assign(Options, new_options);
   },
 
-  async close(port) {
+  close(port) {
+    console.log('Close called');
     const connection = connections.get(port);    
     if ( ! connection ) {
       return true;
     }
+    console.log('Saving tabs');
+    const t = connection.tabs || [];
+    tabsOnClose.set(port, Array.isArray(t) ? t : [...t.values()]);
     connections.delete(port);
-    return await connection.close();
+    return connection.close();
   },
 
   getActiveTarget(port) {
@@ -346,8 +359,10 @@ const controller_api = {
     if ( ! tabs ) throw new TypeError(`No tabs provided.`);
     const connection = connections.get(port);
     if ( ! connection ) return;
-    tabs.forEach(({targetId}) => {
+    tabs.forEach(tab => {
+      const {targetId} = tab;
       connection.targets.add(targetId);
+      connection.tabs.set(targetId, tab);
     });
   },
 
@@ -380,6 +395,22 @@ const controller_api = {
       }
       //({Page, Target} = connection.zombie);
       command = command || {};
+      if ( command.sessionId && getWorker(command.sessionId) && !workerAllows(command.name) ) {
+        console.warn(`Blocking ${command.name} from worker ${command.sessionId}`);
+        retVal.data = {};
+        return retVal;
+      }
+      if ( DEBUG.logFileCommands && LOG_FILE.Commands.has(command.name) ) {
+        let stack = '';
+        if ( DEBUG.noteCallStackInLog ) {
+          stack = (new Error).stack; 
+        }
+        console.info(`Logging`, command, stack);
+        fs.appendFileSync(LOG_FILE.FileHandle, JSON.stringify({
+          timestamp: (new Date).toISOString(),
+          command,
+        },null,2)+"\n");
+      }
       DEBUG.val >= DEBUG.high && !command.isBufferedResultsCollectionOnly && console.log(JSON.stringify(command));
       if ( command.isBufferedResultsCollectionOnly ) {
         DEBUG.frameDebug && process.stdout.write('.');
@@ -395,7 +426,7 @@ const controller_api = {
           break;
           case "Connection.doShot": {
             DEBUG.val && console.log("Calling do shot");
-            connection.doShot();
+            connection.doShot({forceFrame:true});
           }
           break;
           case "Connection.getFavicon": {
@@ -404,7 +435,7 @@ const controller_api = {
             DEBUG.debugFavicon && console.log('Received message to Get Favicon', 
               {targetId, faviconDataUrl}, connection.favicons, command, connection.sessions);
             if ( faviconDataUrl ) {
-              connection.meta.push({
+              connection.forceMeta({
                 favicon: {
                   targetId,
                   faviconDataUrl
@@ -441,6 +472,20 @@ const controller_api = {
               }
             }
             retVal.data = {sessionContextIdPairs:allContexts};
+          }
+          break;
+          case "Connection.clearCacheAndHistory": {
+            try {
+              spawn('bbclear', [], {
+                detached: true,
+                stdio: 'ignore',
+                cwd: os.homedir(),
+                shell: true,
+                timeout: 15000,
+              });
+            } catch(e) {
+              console.warn("Error running exec to clear cache and history", e);
+            }
           }
           break;
           case "Connection.getAllSessionIds": {
@@ -504,18 +549,49 @@ const controller_api = {
             }
           }
           break;
+          case "Connection.sizeAll": {
+            const {width, height} = command.params;
+            console.info(`Implement size all`, width, height);
+          }
+          break;
           case "Connection.closeModal": {
-            connection.meta.push({
+            connection.forceMeta({
               closeModal: command.params
             });
             DEBUG.val && console.log(`received close modal and sent to clients`, command);
           }
           break;
           case "Connection.activateTarget": {
-            connection.meta.push({
+            connection.forceMeta({
               activateTarget: command.params
             });
             DEBUG.val && console.log(`received activateTarget and sent to clients`, command);
+          }
+          break;
+          case "Connection.extensions.actionOnClicked": {
+            const {id} = command.params;
+            const worker = getWorker(id);
+            if ( ! worker ) {
+              console.warn(`Worker unknown for extension: ${id}`);
+              return;
+              // we could fall back to
+              //connection.forceMeta({createTab:{opts:{url:`chrome-extension://${id}/popup.html`}}});
+            }
+            const {width,height} = connection.bounds;
+            const expression = `__currentViewport = {left:0,top:0,...${JSON.stringify({width,height})}};__hear({name:"actionOnClicked"});`
+            console.log(`ok`, expression);
+            //connection.zombie.send("Target.activateTarget", { targetId: worker.targetId }, worker.sessionId).catch(err => console.warn(`Error activate target`));
+            connection.zombie.send("Runtime.evaluate", 
+              {
+                contextId: 1,
+                expression,
+              }, 
+              worker.sessionId,
+            ).then(sendResult => {
+              if ( DEBUG.debugSetupWorker ) {
+                console.info(`Telling extension worker to execute action on clicked code results in: `, sendResult, {worker, command, expression});
+              }
+            }).catch(err => console.warn(`Error trying to send command: %s to extension`, command.name, err, {command}, {port}));
           }
           break;
           default: {
@@ -547,7 +623,7 @@ const controller_api = {
           );
           **/
           if ( response?.meta ) {
-            connection.meta.push(...response.meta);
+            connection.forceMeta(...response.meta);
           } else if ( response ) {
             retVal.data = response;
           } else {
@@ -565,7 +641,7 @@ const controller_api = {
       }
       if ( command.requiresShot || command.forceFrame ) {
         DEBUG.frameDebug && console.log({forceFrame:{command}});
-        await connection.doShot({ignoreHash: command.ignoreHash || command.forceFrame});
+        await connection.doShot({ignoreHash: command.ignoreHash || command.forceFrame, blockExempt: command.name == "Target.activateTarget"});
       }
       if ( command.requiresTailShot ) {
         connection.queueTailShot({ignoreHash: command.ignoreHash});
@@ -614,6 +690,13 @@ const controller_api = {
     return retVal;
   },
 
+  notifyBandwidthIssue(port, {issue}) {
+    const connection = connections.get(port);
+    if ( connection ) {
+      connection.forceMeta({bandwidthIssue: issue ? 'yes' : 'no'});
+    }
+  },
+
   saveIP(ip_address) {
     this.ip_address = ip_address;
     console.log("Connect from", ip_address);
@@ -642,6 +725,31 @@ const controller_api = {
 
   getConnection(port) {
     return connections.get(port);
+  },
+
+  deleteConnection(port) {
+    connections.delete(port);
+  },
+
+  getTargets(port) {
+    const t = connections.get(port)?.tabs || tabsOnClose.get(port);
+    if ( ! t ) {
+      DEBUG.showNoTargets && console.warn('Could not get tabs on close, returning a dummy tab to not spawn excessive tabs on restart');
+      return [{dummy:true}];
+    }
+    return Array.from(Array.isArray(t) ? t : [...t.values()]);
+  },
+
+  setViewport(connectionId, viewport, port) {
+    const connection = connections.get(port);
+    if ( ! connection ) {
+      throw new TypeError(`No such connection on port: ${port}`);
+    }
+    if ( !viewport.deviceScaleFactor ) {
+      viewport.deviceScaleFactor = 1;
+    }
+    connection.viewports.set(connectionId, viewport);
+    updateTargetsOnCommonChanged({connection,command:"all"});
   }
 };
 

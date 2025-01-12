@@ -6,6 +6,8 @@ import {DEBUG, sleep, deviceIsMobile as isMobile} from './voodoo/src/common.js';
     let repeat = true;
 
   //window.addEventListener('load', resizeAndReport, {once:true});
+  resizeAndReport();
+
   window.addEventListener('message', ({data,origin}) => {
     const target = new URL(location);
     target.port = parseInt(location.port) - 1;
@@ -19,43 +21,40 @@ import {DEBUG, sleep, deviceIsMobile as isMobile} from './voodoo/src/common.js';
     }
   });
 
-  if ( isMobile() ) {
-    window.addEventListener('orientationchange', e => {
-      //window._voodoo_asyncSizeTab();
-      try {
-        if ( document.fullscreenElement ) {
+  window.addEventListener('orientationchange', e => {
+    //window._voodoo_asyncSizeTab();
+    try {
+      if ( document.fullscreenElement ) {
+        resizeAndReport();
+      } else {
+        timers.forEach(clearTimeout);
+        timers.push(setTimeout(() => {
+          DEBUG.val >= DEBUG.med && console.info("Device re-oriented! Updating remote viewport.");
           resizeAndReport();
-        } else {
-          timers.forEach(clearTimeout);
-          timers.push(setTimeout(() => {
-            DEBUG.val >= DEBUG.med && console.info("Device re-oriented! Updating remote viewport.");
-            resizeAndReport();
-          }, 50));
-        }
-      } catch(e) {
-        console.warn('Error on orientation change', e);
+        }, 50));
       }
-    });
-  } else {
-    window.addEventListener('resize', e => {
-      try {
-        //window._voodoo_asyncSizeTab();
-        if ( document.fullscreenElement ) {
-          resizeAndReport()
-        } else {
-          timers.forEach(clearTimeout);
-          timers.push(setTimeout(() => {
-            DEBUG.val >= DEBUG.med && console.info(`Window resized! Updating remote viewport.`);
-            resizeAndReport()
-          }, 50));
-        }
-      } catch(e) {
-        console.warn('Error on resize', e);
-      }
-    });
-  }
+    } catch(e) {
+      console.warn('Error on orientation change', e);
+    }
+  });
 
-  resizeAndReport();
+  window.addEventListener('resize', e => {
+    try {
+      //window._voodoo_asyncSizeTab();
+      if ( document.fullscreenElement ) {
+        resizeAndReport()
+      } else {
+        timers.forEach(clearTimeout);
+        timers.push(setTimeout(() => {
+          DEBUG.val >= DEBUG.med && console.info(`Window resized! Updating remote viewport.`);
+          resizeAndReport()
+        }, 50));
+      }
+    } catch(e) {
+      console.warn('Error on resize', e);
+    }
+  });
+
   async function resizeAndReport() {
     if ( running ) return;
     await sleep(500);

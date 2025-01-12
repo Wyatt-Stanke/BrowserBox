@@ -1,7 +1,7 @@
 //FIXME we could move this into constructor 
 // and switch it to WS 
 
-import {untilTrue,COMMON,DEBUG} from '../common.js';
+import {version,uberFetch,untilTrue,CONFIG,COMMON,DEBUG, AttachmentTypes, HIDDEN_DOMAINS} from '../common.js';
 import DEFAULT_FAVICON from '../subviews/faviconDataURL.js';
 
 const STATE_SYMBOL = Symbol(`[[State]]`);
@@ -13,14 +13,32 @@ export async function fetchTabs({sessionToken}, getState) {
   DEBUG.debugTabs && console.log(`Fetch tabs called`);
   try {
     const url = new URL(location);
-    url.pathname = '/api/v1/tabs';
-    const resp = await fetch(url);
+    url.pathname = `/api/${version}/tabs`;
+    const resp = await uberFetch(url);
     if ( resp.ok ) {
       const data = await resp.json();
       if ( data.error ) {
         if ( data.resetRequired ) {
-          const reload = confirm(`Some errors occurred and we can't seem to reach your cloud browser. You can try reloading the page and if the problem persists, try switching your cloud browser off then on again. Want to reload the page now?`);
-          if ( reload ) location.reload();
+          const state = getState();
+          if ( ! state.connected ) {
+            if ( globalThis.purchaseClicked ) return;
+            if ( state?.wipeIsInProgress || globalThis.wipeIsInProgress ) return;
+            if ( globalThis.comingFromTOR ) return;
+            if ( CONFIG.isCT ) {
+              alert(`Your session expired. Close this message to return to your dashboard.`);
+              try {
+                top.location.href = 'https://browse.cloudtabs.net/'
+              } catch {
+                location.href = 'https://browse.cloudtabs.net/'
+              }
+            } else {
+              if ( globalThis.alreadyExpired || globalThis.windowUnloading ) return;
+              globalThis.alreadyExpired = true;
+              alert(`Your session has expired or disconnected.`);
+            }
+          } else {
+            alert(`An error occurred. You might need to reload the page, or switch your remote browser off then on again. That is all we know.`);
+          }
         }
       } 
       if ( data.vmPaused ) {
@@ -49,27 +67,58 @@ export async function fetchTabs({sessionToken}, getState) {
       }
       DEBUG.debugBetterModals && console.log(data);
       if ( data.tabs ) {
-        data.tabs = (data.tabs || []).filter(({type}) => type == 'page');
+        data.tabs = (data.tabs || []).filter(({type,url}) => AttachmentTypes.has(type) && ! HIDDEN_DOMAINS.has((new URL(url)).hostname));
         data.tabs = data.tabs.map(tab => new Tab(tab, {getState}));
       }
       DEBUG.debugTabs && console.log(data);
       return data;
     } else if ( resp.status == 401 ) {
       console.warn(`Session has been cleared. Let's attempt relogin`, sessionToken);
+      COMMON.blockAnotherReset = true;
       const x = new URL(location);
       x.pathname = 'login';
       x.search = `token=${sessionToken}&ran=${Math.random()}`;
-      COMMON.blockAnotherReset = true;
       alert("Your browser cleared your session. We need to reload the page to refresh it.");
       COMMON.delayUnload = false;
-      location.href = x;
+      if ( ! DEBUG.noReset ) {
+        location.href = x;
+      }
       return;
+    } else if ( resp.status == 404 ) {
+      console.warn(`404 on key tabs endpoint`);
+      COMMON.blockAnotherReset = true;
+      alert(`Your app has been updated. We will reload and try again. Try clearing your caches if that doesn't work.`);
+      const x = new URL(location);
+      x.pathname = 'login';
+      x.search = `token=${sessionToken}&ran=${Math.random()}`;
+      COMMON.delayUnload = false;
+      if ( ! DEBUG.noReset ) {
+        location.href = x;
+      }
+      return;
+    } else {
+      alert(`An error occurred and we could not access the server. It may be down or you may be offline. If you're online, try again.`);
     }
   } catch(e) {
     console.warn(e);
-    alert(e);
-    const reload = confirm(`Some errors occurred and we can't seem to reach your cloud browser. You can try reloading the page and if the problem persists, try switching your cloud browser off then on again. Want to reload the page now?`);
-    if ( reload ) location.reload();
+    const state = getState();
+    if ( ! state.connected ) {
+      if ( globalThis.purchaseClicked ) return;
+      if ( state?.wipeIsInProgress || globalThis.wipeIsInProgress ) return;
+      if ( globalThis.comingFromTOR ) return;
+      if ( CONFIG.isCT ) {
+        alert(`Your session expired. Close this message to return to your dashboard.`);
+        try {
+          top.location.href = 'https://browse.cloudtabs.net/'
+        } catch {
+          location.href = 'https://browse.cloudtabs.net/'
+        }
+      } else {
+        if ( globalThis.alreadyExpired || globalThis.windowUnloading ) return;
+        globalThis.alreadyExpired = true;
+        alert(`Your session has expired or disconnected.`);
+      }
+    } 
   }
 }
 

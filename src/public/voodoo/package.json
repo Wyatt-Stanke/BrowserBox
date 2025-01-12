@@ -7,8 +7,7 @@
   "main": "index.js",
   "scripts": {
     "test": "serve -p 8080",
-    "postinstall": "cp node_modules/simple-peer/simplepeer.min.js src/ && cp node_modules/lucide-static/icons/*.svg assets/icons/",
-    "postinstall-win": "copy node_modules/simple-peer/simplepeer.min.js src/ && mkdir -p ./assets/icons && copy node_modules/lucide-static/icons/*.svg assets/icons/",
+    "postinstall": "node exec.js \"./expose_externals.sh\"",
     "prepublishOnly": "echo 'do not publish this' && fail"
   },
   "repository": {
@@ -22,10 +21,8 @@
   },
   "homepage": "https://gitlab.com/dosycorp/voodoo#readme",
   "dependencies": {
-    "bang.html": "^6.0.0",
-    "dumbass": "^2.7.0",
-    "lucide-static": "^0.101.0",
-    "maskingtape.css": "^1.11.4",
+    "bang.html": "latest",
+    "lucide-static": "latest",
     "style.dss": "latest",
     "vanillatype": "latest"
   },
