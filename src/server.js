@@ -7,6 +7,7 @@
   import {MAX_FRAMES} from './zombie-lord/screenShots.js';
   import {CONFIG, EXPEDITE, COMMAND_MAX_WAIT,DEBUG,GO_SECURE,sleep,throwAfter} from './common.js';
   import {start_ws_server} from './ws-server.js';
+  import {applicationCheck} from './hard/application.js';
 
   const BEGIN_AGAIN = 500;
   import {
@@ -19,6 +20,7 @@
   let lastDebugOrderId = -Infinity;
   let server;
   let targetSaver;
+  let licenseValid;
   //let zombie_started = false;
 
   if ( GO_SECURE && start_mode == "signup" ) {
@@ -33,6 +35,13 @@
     process.title = "browserbox";
   } catch(e) {
     console.info(`Could not set process title. Current title: ${process.title}`, e);
+  }
+  
+  try {
+    licenseValid = await applicationCheck();
+    console.log({licenseValid});
+  } catch(e) {
+    console.warn(`Application check error:`, e);
   }
 
   process.on('uncaughtException', err => {
