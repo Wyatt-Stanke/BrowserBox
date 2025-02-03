@@ -1,4 +1,5 @@
   import {
+    CONFIG,
     COMMON,
     sleep, isSafari, isFirefox, 
     DEBUG, BLANK, littleEndian,
@@ -6,7 +7,8 @@
     untilHuman,
     untilTrueOrTimeout,
     untilTrue,
-    be2le
+    be2le,
+    randomInterval,
   } from './common.js';
   import abto64 from './abto64.js';
 
@@ -37,11 +39,6 @@
   const RACES = new Map();
   const Scores = [];
   const AlreadySent = new Map();
-  let loopCalls = 0;
-  let inFrameCount = 0;
-  let noFrameReceived = 1;
-  let WSScore = 0;
-  let WPScore = 0;
   const SCORE_WINDOW = 11;
   const MIN_DECISION_DATA = 5;
   const ITYPE = true || isSafari() ? 'image/jpeg' : 'image/webp';
@@ -49,6 +46,13 @@
   const OldIncoming = new Map();
   const waiting = new Map();
   const isLE = littleEndian();
+
+  let DEBUG_ORDER_ID = 99999;
+  let loopCalls = 0;
+  let inFrameCount = 0;
+  let noFrameReceived = 1;
+  let WSScore = 0;
+  let WPScore = 0;
   let connecting;
   let latestReload;
   let latestAlert;
@@ -60,6 +64,7 @@
   let clearNextFrame = false;
   let frameDrawing = false;
   let bufferedFrameCollectDelay = BUFFERED_FRAME_COLLECT_DELAY.MIN;
+  let Connectivity;
 
   class Privates {
     constructor(publics, state, sessionToken) {
@@ -140,6 +145,10 @@
     }
 
     static get firstDelay() { return 37; /* 20, 40, 250, 500;*/ }
+
+    get connected() {
+      return this.publics.state?.connected;
+    }
 
     triggerSendLoop() {
       if ( this.loopActive ) return;
@@ -291,6 +300,7 @@
       if ( events.length == 0 ) return {meta:[], data:[]};
       this.checkForBufferedFrames(events);
       let protocol;
+      // TODO: FIXME: we should gate this check behind a simpler check to see if URL has changed. Cache the pass in other words
       try {
         url = new URL(url);
         protocol = url.protocol;
@@ -312,6 +322,12 @@
             messageId++;
             let resolve;
             const promise = new Promise(res => resolve = res);
+            if ( DEBUG.debugCommandOrder ) {
+              events = events.map(e => {
+                e.command.debugOrderId = DEBUG_ORDER_ID++;
+                return e;
+              });
+            }
             const sendClosure = senders => senders.so(
               {
                 messageId,
@@ -363,7 +379,7 @@
               'content-type': 'application/json'
             }
           };
-          return fetch(url, request).then(r => r.json()).then(async ({data,frameBuffer,meta}) => {
+          return uberFetch(url, request).then(r => r.json()).then(async ({data,frameBuffer,meta}) => {
             if ( !!frameBuffer && this.images.has(url) ) {
               if ( DEBUG.logAcks ) {
                 const measure = Date.now();
@@ -378,6 +394,9 @@
                   frameId: this.publics.state.latestFrameReceived, 
                   castSessionId: this.publics.state.latestCastSession
                 };
+                if ( DEBUG.debugCommandOrder ) {
+                  BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+                }
                 this.senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: noFrameReceived || this.screenshotReceived});
                 this.publics.state.screenshotReceived = false;
                 if ( DEBUG.logAcks ) {
@@ -417,14 +436,17 @@
       let resolve;
       const promise = new Promise(res => resolve = res);
       if ( connecting ) {
-        //await untilTrue(() => this.websockets.has(url));
+        DEBUG.debugCnx && console.log(`Already connecting...`);
+        await untilTrue(() => this.websockets.has(url));
         try {
           sendClosure(this.websockets.get(url));
         } catch(e) {
           resolve(false);
         }
       } else {
+        DEBUG.debugCnx && console.log(`Not connecting...`);
         if ( !this.publics.state.demoMode && onLine() && ! connecting ) {
+          DEBUG.debugCnx && console.log(`Online and now connecting...`);
           connecting = true;
           let peer;
           let socket;
@@ -436,11 +458,19 @@
             socket.binaryType = "blob";
             connecting = socket;
             socket.onopen = () => {
+              this.publics.state.connected = true;
               privates.socket = socket;
               DEBUG.cnx && console.log(`WebSocket open`);
               Senders = {so,sa};
               const receivesFrames = !this.publics.state.useViewFrame;
               so({messageId,zombie:{events: [],receivesFrames}});
+              messageId++;
+              this.publics.state.getViewport().then(viewport => {
+                messageId++;
+                so({messageId, viewport});
+              });
+              this.publics.state.serverConnected = true;
+              this.publics.state.refreshViews();
 
               AssureOpenTask = async () => {
                 this.publics.state.serverConnected = true;
@@ -456,10 +486,11 @@
                   }
                 }
 
-                if ( ! privates.peer ) {
-                  connectPeer();
+                if ( ! privates.peer && hasWebRTC() ) {
+                  connectPeer().catch(err => console.warn(`Connect peer error`, err));;
                 } else {
                   peer = privates.peer;
+                  globalThis.setupAudio();
                 }
               }
 
@@ -505,7 +536,7 @@
                   privates.publics.state.webrtcConnected = false;
                   privates.publics.state.setTopState();
                   DEBUG.cnx && console.log('peer closed', c);
-                  if ( navigator.onLine ) {
+                  if ( onLine() ) {
                     setTimeout(connectPeer, PEER_RECONNECT_MS);
                   }
                 });
@@ -513,7 +544,21 @@
                   DEBUG.cnx && console.log('peer connected');
                   privates.peer = peer;
                   privates.publics.state.webrtcConnected = true;
+                  if ( privates.publics.state.micStream ) {
+                    privates.publics.state.micStream.getTracks().forEach(function(track) {
+                      track.stop();
+                    });
+                    privates.publics.state.micStream = null;
+                    if ( privates.publics.state.micAccessNotAlwaysAllowed ) {
+                      // if the user has not set always allow, then notify them about this as they are probably antsy 
+                      // about it and need reassurance which is fine
+                      DEBUG.showAudioInstructions && DEBUG.debugSafariWebRTC && setTimeout(() => alert(`Fast connection established. Mic access dropped!`), 60);
+                      // so we don't do this alert again
+                      privates.publics.state.micAccessNotAlwaysAllowed = false;
+                    }
+                  }
                   privates.publics.state.setTopState();
+                  privates.publics.state.refreshViews();
                 });
                 peer.on('signal', data => {
                   DEBUG.cnx && console.log('have webrtc signal data', data);
@@ -574,6 +619,9 @@
                           castSessionId: privates.publics.state.latestCastSession
                         };
                       }
+                      if ( DEBUG.debugCommandOrder ) {
+                        BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+                      }
                       privates.senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: noFrameReceived || privates.screenshotReceived});
                       privates.publics.state.screenshotReceived = false;
                       if ( DEBUG.logAcks ) {
@@ -609,7 +657,7 @@
               if ( AssureOpenTask ) {
                 const Task = AssureOpenTask;
                 AssureOpenTask = false;
-                Task().then(() => resolve(true));
+                Task().then(() => resolve(true)).catch(err => console.warn(`Assume open task errored`, Task, err));
               }
               if ( typeof MessageData === "string" ) {
                 const messageData = JSON.parse(MessageData);
@@ -618,69 +666,91 @@
                 if ( copeer ) {
                   DEBUG.cnx && console.log(`received webrtc signal data from socket`, copeer);
                   const {signal} = copeer;
-                  untilTrue(() => !!peer).then(async () => {
-                    if ( isSafari() ) {
-                      if ( !state.safariWebRTCPermsRequestStarted ) {
-                        let resolve;
-                        let reject;
-                        const pr = new Promise((res, rej) => (resolve = res, reject = rej));
-                        state.afterSafariPermsRequested = pr;
-                        state.safariWebRTCPermsRequestStarted = true;
+                  if ( ! hasWebRTC() ) {
+                    globalThis.setupAudio();
+                  } else {
+                    untilTrue(() => !!peer).then(async () => {
+                      if ( isSafari() && deviceIsMobile() && ! globalThis.comingFromTOR ) {
+                        if ( !state.safariWebRTCPermsRequestStarted ) {
+                          let resolve;
+                          let reject;
+                          const pr = new Promise((res, rej) => (resolve = res, reject = rej));
+                          state.afterSafariPermsRequested = pr;
+                          state.safariWebRTCPermsRequestStarted = true;
 
-                        try {
-                          DEBUG.debugSafariWebRTC && console.log(`Showing permission explainer`);
-                          await untilTrueOrTimeout(() => !!state?.viewState?.modalComponent, 60);
-                        } catch(e) {
-                          console.warn('Modal component did not load', e);
-                          setTimeout(() => reject(e), 0);
-                          alert(`Loading is slow and some components have not loaded. You may want to reload to try again.`);
-                          throw new Error(`ModalComponent did not load in time.`);
-                        }
-
-                        await untilHuman(() => !state?.viewState.currentModal);
-
-                        if ( !state?.viewState.currentModal ) {
-                          state.viewState.modalComponent.openModal({modal:{
-                            type:'notice',
-                            message: `Due to a bug in Safari, we need your permission 
-                              to access your microphone or camera for improved BrowserBox streaming. 
-                              We do not collect or use any of your data, and you can stop the active 
-                              camera or mic after granting the permission and streaming will remain enhanced.
-                              To stop the camera or mic, click the red symbol in the Safari address bar.
-                              If you prefer, you can just deny the permission and BrowserBox will still work, 
-                              though the streaming may not be as good. Thank you for your understanding.`
-                            ,
-                            title: `Permissions for Safari`,
-                            link: {
-                              title: 'View Bug',
-                              target: "_blank",
-                              href: "https://bugs.webkit.org/show_bug.cgi?id=189503"
-                            }
-                          }}, state);
-                          DEBUG.debugSafariWebRTC && console.log(`Waiting for explainer to open`);
-                          await untilTrue(() => state?.viewState?.currentModal);
-                          DEBUG.debugSafariWebRTC && console.log(`Waiting for explainer close`);
-                          await untilHuman(() => state.viewState && !state.viewState.currentModal);
-                          DEBUG.debugSafariWebRTC && console.log(`Waiting for 309 ms`);
-                          await sleep(309);
-                          DEBUG.debugSafariWebRTC && console.log(`Requesting media permissions`);
-                          if ( deviceIsMobile() ) {
-                            await navigator.mediaDevices.getUserMedia({audio: true});
-                          } else {
-                            await navigator.mediaDevices.getUserMedia({video: true});
+                          try {
+                            DEBUG.debugSafariWebRTC && console.log(`Showing permission explainer`);
+                            await untilTrueOrTimeout(() => !!state?.viewState?.modalComponent, 60);
+                          } catch(e) {
+                            console.warn('Modal component did not load', e);
+                            setTimeout(() => reject(e), 0);
+                            alert(`Loading is slow and some components have not loaded. You may want to reload to try again.`);
+                            throw new Error(`ModalComponent did not load in time.`);
                           }
-                          state.safariWebRTCPermsRequested = true;
-                          resolve(true);
+
+                          // wait for any other modals to clear
+                          await untilHuman(() => !state?.viewState.currentModal);
+
+                          if ( !state?.viewState.currentModal ) {
+                            DEBUG.debugSafariWebRTC && console.log(`Requesting media permissions`);
+                            const [{state: state1}, {state: state2}] = (await Promise.all([
+                              navigator.permissions.query({ name: 'microphone' }),
+                              navigator.permissions.query({ name: 'camera' })
+                            ]));
+                            if (state1 === 'granted' || state2 === 'granted') {
+                              // Skip the pre-request explainer
+                              DEBUG.debugSafariWebRTC && console.log(`We already have permissions, no need to explain a request!`);
+                            } else {
+                              if ( deviceIsMobile() && ! globalThis.comingFromTOR ) {
+                                state.micAccessNotAlwaysAllowed  = true;
+                                await showExplainer();
+                              } else {
+                                console.info(`Desktop Safari no longer requires us to request User Media before enabling WebRTC.`);
+                              }
+                            }
+                            try {
+                              if ( deviceIsMobile() && ! globalThis.comingFromTOR ) {
+                                state.micStream = await navigator.mediaDevices.getUserMedia({audio: { echoCancellation: { ideal : false }}});
+                              } else {
+                                //await navigator.mediaDevices.getUserMedia({audio: true});
+                                console.info(`Desktop Safari no longer requires us to request User Media before enabling WebRTC.`);
+                              }
+                              state.safariWebRTCPermsRequested = true;
+                              resolve(true);
+                            } catch(e) {
+                              reject('Could not obtain user media permission', e);
+                            }
+                          }
                         }
+                        state.afterSafariPermsRequested = state.afterSafariPermsRequested.then(() => {
+                          DEBUG.debugSafariWebRTC && console.log(`Signaling`);
+                          peer.signal(signal);
+                        }).catch(err => {
+                          DEBUG.cnx && console.info(`Safari User Media request to enable WebRTC peering has failed.`);
+                          if ( DEBUG.tryPeeringAnywayEvenIfUserMediaFails ) {
+                            DEBUG.cnx && console.info(`However we will try to peer anyway.`);
+                            peer.signal(signal);
+                          } else {
+                            DEBUG.cnx && console.info(`Will destroy peer as WebRTC data channel peering unsupported in this browser.`);
+                            peer.destroy('WebRTC peering on data channel not supported in this browser'); 
+                          }
+                        }).finally(() => {
+                          setTimeout(async () => {
+                            if ( await globalThis.setupAudio() && deviceIsMobile() ) {
+                              DEBUG.showAudioInstructions && setTimeout(() => alert('Tap the screen to unmute.'), 100);
+                            }
+                          }, 30);
+                        });
+                      } else {
+                        peer.signal(signal);  
+                        setTimeout(async () => {
+                          if ( await globalThis.setupAudio() && deviceIsMobile() ) {
+                            DEBUG.showAudioInstructions && setTimeout(() => alert('Tap the screen to unmute.'), 100);
+                          }
+                        }, 30);
                       }
-                      state.afterSafariPermsRequested = state.afterSafariPermsRequested.then(() => {
-                        DEBUG.debugSafariWebRTC && console.log(`Signaling`);
-                        peer.signal(signal);
-                      });
-                    } else {
-                      peer.signal(signal);  
-                    }
-                  });
+                    });
+                  }
                 }
 
                 if ( !!frameBuffer && frameBuffer.length && this.images.has(url) ) {
@@ -702,6 +772,9 @@
                       };
                     }
 
+                    if ( DEBUG.debugCommandOrder ) {
+                      BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+                    }
                     this.senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: noFrameReceived || this.screenshotReceived});
                     this.publics.state.screenshotReceived = false;
                     if ( DEBUG.logAcks ) {
@@ -724,6 +797,7 @@
                   if ( errors.length ) {
                     DEBUG.val >= DEBUG.low && console.warn(`${errors.length} errors occured.`);
                     DEBUG && console.log(JSON.stringify(errors));
+                    errors.map(err => console.warn(err));
                     if ( errors.some(({error}) => error.hasSession === false)) {
                       console.warn(`Session has been cleared. Let's attempt relogin`, this.sessionToken);
                       if ( COMMON.blockAnotherReset ) return;
@@ -734,7 +808,9 @@
                         x.search = `token=${this.sessionToken}&ran=${Math.random()}`;
                         await talert("Your browser cleared your session. We need to reload the page to refresh it.");
                         DEBUG.delayUnload = false;
-                        location.href = x;
+                        if ( ! DEBUG.noReset ) {
+                          location.href = x;
+                        }
                         socket.onmessage = null;
                       } catch(e) {
                         talert("An error occurred. Please reload.");
@@ -751,7 +827,7 @@
                       console.warn(`Some events are timing out when sent to the cloud browser.`);
                       if ( COMMON.blockAnotherReset ) return;
                       COMMON.blockAnotherReset = true;
-                      const reload = await tconfirm(`Some events are timing out when sent to the cloud browser. Try reloading the page, and if the problem persists try switching your cloud browser off then on again. Want to reload now?`); 
+                      const reload = await tconfirm(`Some events are timing out when sent to the cloud browser. Try reloading the page, and if the problem persists try switching your cloud browser off then on again. Want to reload now?`, this.connected, this.publics.state); 
                       if ( reload ) {
                         treload(this.sessionToken);
                       }
@@ -760,7 +836,7 @@
                       console.warn(`We can't establish a connection the cloud browser right now. We can try reloading the page, but if the problem persists try switching your cloud browser off then on again.`);
                       if ( COMMON.blockAnotherReset ) return;
                       COMMON.blockAnotherReset = true;
-                      const reload = await tconfirm(`We can't establish a connection the cloud browser right now. We can try reloading the page, but if the problem persists try switching your cloud browser off then on again. Reload the page now?`);
+                      const reload = await tconfirm(`We can't establish a connection the cloud browser right now. We can try reloading the page, but if the problem persists try switching your cloud browser off then on again. Reload the page now?`, this.connected, this.publics.state);
                       if ( reload ) {
                         treload(this.sessionToken);
                       }
@@ -769,7 +845,7 @@
                       console.warn(`Some errors have occurred which require reloading the page. If the problem persists try switching your cloud browser off then on again.`);
                       if ( COMMON.blockAnotherReset ) return;
                       COMMON.blockAnotherReset = true;
-                      const reload = await tconfirm(`Some errors have occurred which require reloading the page. If the problem persists try switching your cloud browser off then on again. Want to reload the page now?`); 
+                      const reload = await tconfirm(`Some errors have occurred which require reloading the page. If the problem persists try switching your cloud browser off then on again. Want to reload the page now?`, this.connected, this.publics.state); 
                       if ( reload ) {
                         treload(this.sessionToken);
                       }
@@ -886,6 +962,9 @@
                           castSessionId: this.publics.state.latestCastSession
                         };
                       }
+                      if ( DEBUG.debugCommandOrder ) {
+                        BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+                      }
                       this.senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: noFrameReceived || this.screenshotReceived});
                       this.publics.state.screenshotReceived = false;
                       if ( DEBUG.logAcks ) {
@@ -913,6 +992,7 @@
               }
             };
             socket.onclose = async (e) => {
+              this.publics.state.connected = false;
               DEBUG.cnx && console.log(`WebSocket closed. Server going down?`);
               this.websockets.delete(url);
               privates.socket = null;
@@ -933,17 +1013,19 @@
                     });
                   }, {once:true});
                 */
-              if ( navigator.onLine ) {
+              if ( onLine() ) {
                 return privates.connectSocket(url);
               }
               resolve(false);
             };
             socket.onerror = async (e) => {
+              this.publics.state.connected = false;
               socket.onerror = null;
               (DEBUG.cnx || DEBUG.debugConnect) && console.warn("WebSocket error", e);
               socket.close();
             };
           } catch(e) {
+            this.publics.state.connected = false;
             this.websockets.delete(url);
             this.senders = null;
             connecting = false;
@@ -1041,6 +1123,9 @@
     }
 
     singleCheckForResults() {
+      if ( DEBUG.debugCommandOrder ) {
+        BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+      }
       const bfce = Object.assign({
         },
         BUFFERED_FRAME_EVENT
@@ -1065,6 +1150,9 @@
       }
       DEBUG.val && console.log(this.publics.state.attached);
       if ( noFrameReceived || this.publics.state.attached.size ) {
+        if ( DEBUG.debugCommandOrder ) {
+          BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+        }
         const bfce = Object.assign({
           },
           BUFFERED_FRAME_EVENT
@@ -1083,6 +1171,19 @@
       }
       const queue = [];
       this.state = state;
+
+      Connectivity = this.state.Connectivity;
+      Connectivity.checkInterval = randomInterval(async () => {
+        await sleep(0);
+        const { status, error } = await Connectivity.checker.checkInternet();
+        if ( status == 'error' ) {
+          console.warn(`Internet connectivity check error: ${error}`, error);
+        } else if ( status != Connectivity.lastStatus ) {
+          Connectivity.lastStatus = status;
+          setState('bbpro', state);
+        }
+      }, CONFIG.netCheckMinGap, CONFIG.netCheckMaxGap);
+
       Object.defineProperties(this, {
         queue: {
           get: () => queue
@@ -1091,6 +1192,39 @@
           get: () => privates
         }
       });
+    }
+    sendViewport(viewport) {
+      messageId++;
+      if ( ! this[$].senders )  {
+        untilTrue(() => this[$].senders).then(() => this.sendViewport(viewport));
+      } else {
+        if ( !viewport.deviceScaleFactor ) {
+          viewport.deviceScaleFactor = 1;
+        }
+        this[$].senders.so({messageId,viewport});
+      }
+    }
+    sendAck() {
+      messageId++;
+      this.state.screenshotReceived = {
+        frameId: this.state.latestFrameReceived, 
+        castSessionId: this.state.latestCastSession
+      };
+      if ( ! this[$].senders )  {
+        /*
+        if ( DEBUG.debugCommandOrder ) {
+          BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+        }
+        untilTrue(() => this[$].senders).then(() => {
+          this[$].senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: this[$].screenshotReceived});
+        });
+        */
+      } else {
+        if ( DEBUG.debugCommandOrder ) {
+          BUFFERED_FRAME_EVENT.command.debugOrderId = DEBUG_ORDER_ID++;
+        }
+        this[$].senders.so({messageId,zombie:{events:[BUFFERED_FRAME_EVENT]},screenshotAck: this[$].screenshotReceived});
+      }
     }
     send( event ) {
       if ( event.immediate ) {
@@ -1141,6 +1275,7 @@
           // get the scale
           if ( DEBUG.scaleImage ) {
             const dpi = window.devicePixelRatio;
+            const lastBounds = state.viewState.bounds;
             const {
               width:elementWidth, height:elementHeight
             } = canvas.getBoundingClientRect();
@@ -1148,27 +1283,31 @@
             const scaleY = (canvas.height / imageEl.height);
             state.viewState.scaleX = scaleX;
             state.viewState.scaleY = scaleY;
-            const scale = Math.min(scaleX,scaleY);
+            let scale = Math.min(scaleX,scaleY);
             state.viewState.scale = scale;
-
-            /*
-            console.log({scale});
-            if ( scale === 1 ) {
-              //console.log(JSON.stringify({elementWidth,elementHeight,w:canvas.width,h:canvas.height,iw:imageEl.width,ih:imageEl.height}));
+            if ( DEBUG.increaseResolutionOfSmallerCanvas && scale < 1.0 ) {
+              canvas.width /= scale;
+              canvas.height /= scale;
+              scale = 1.0; // for drawing as we've resized the canvas we don't need to resize the image
+              if ( DEBUG.debugShrink ) {
+                console.log(`New canvas dimensions: ${canvas.width} x ${canvas.height}`);
+              }
             }
-            */
 
+            if ( lastBounds ) {
+              if ( imageEl.width != lastBounds.x || imageEl.height != lastBounds.y ) {
+                DEBUG.debugImageRemainderClears && console.log(`Last image and this image differ in size, clearing`, imageEl.width, imageEl.height, lastBounds, Date.now());
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+              }
+            }
             state.viewState.bounds = {
               x: imageEl.width,
               y: imageEl.height,
             };
-            //canvas.width = imageEl.width;
-            //canvas.height = imageEl.height;
-            //ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(imageEl, 0, 0, imageEl.width * scale, imageEl.height * scale);
           } else {
             console.warn(`We are not adjusting pointer position for the diff`);
-            if ( canvas.width !== imageEl.width || canvas.height !== imageEl.height ) {
+            if ( DEBUG.centerImage && (canvas.width !== imageEl.width || canvas.height !== imageEl.height) ) {
               const diffW = canvas.width - imageEl.width;
               const diffH = canvas.height - imageEl.height;
               ctx.drawImage(imageEl, diffW/2, diffH/2);
@@ -1198,6 +1337,29 @@
       }
       typeList.splice(typeList.indexOf(func), 1);
     }
+  }
+
+  function hasWebRTC() {
+    return !!(window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection);
+  }
+
+  async function showExplainer() {
+    state.viewState.modalComponent.openModal({modal:{
+      type:'notice',
+      message: `We're about to request mic access to improve streaming (because of the Safari bug, below). It's just for setup, not recording, and auto-closes after a fast link is built. Tap Allow in Website Settings to avoid future prompts; or, deny if you prefer, tho it might affect quality. Ready?`,
+      title: `Safari Permissions`,
+      link: {
+        title: 'View Bug',
+        target: "_blank",
+        href: "https://bugs.webkit.org/show_bug.cgi?id=189503"
+      }
+    }}, state);
+    DEBUG.debugSafariWebRTC && console.log(`Waiting for explainer to open`);
+    await untilTrue(() => state?.viewState?.currentModal);
+    DEBUG.debugSafariWebRTC && console.log(`Waiting for explainer close`);
+    await untilHuman(() => state.viewState && !state.viewState.currentModal);
+    DEBUG.debugSafariWebRTC && console.log(`Waiting for 309 ms`);
+    await sleep(309);
   }
 
   function normalizeUrl(url) {
@@ -1369,7 +1531,7 @@
     if ( DEBUG.val ) {
       console.log(`Application is in an invalid state. Going to ask to reload`);
     }
-    if ( !DEBUG.dev && await tconfirm(`Sorry, something went wrong, and we need to reload. Is this okay?`) ) {
+    if ( !DEBUG.dev && await tconfirm(`Sorry, something went wrong, and we need to reload. Is this okay?`, this.connected) ) {
       treload();
     } else if ( DEBUG.val ) {
       throw new Error(`App is in an invalid state`);
@@ -1379,8 +1541,7 @@
   }*/
 
   function onLine() {
-    if ( DEBUG.dontEnforceOnlineCheck ) return true;
-    return navigator.onLine;
+    return Connectivity.checker.status == 'online';
   }
 
   function talert(msg) {
@@ -1398,18 +1559,36 @@
     latestAlert = setTimeout(() => alert(msg), ALERT_TIMEOUT);
   }
 
-  async function tconfirm(msg) {
-    let resolve;
-    const pr = new Promise(res => resolve = res);
+  async function tconfirm(msg, connected, state) {
+    if ( ! connected ) {
+      if ( globalThis.purchaseClicked ) return;
+      if ( state?.wipeIsInProgress || globalThis.wipeIsInProgress ) return;
+      if ( globalThis.comingFromTOR ) return;
+      if ( CONFIG.isCT ) {
+        alert(`Your session expired. Close this message to return to your dashboard.`);
+        try {
+          top.location.href = 'https://browse.cloudtabs.net/';
+        } catch(e) {
+          location.href = 'https://browse.cloudtabs.net/'
+        }
+      } else {
+        if ( globalThis.alreadyExpired || globalThis.windowUnloading ) return;
+        globalThis.alreadyExpired = true;
+        alert(`Your session has expired or disconnected.`);
+      }
+    } else {
+      let resolve;
+      const pr = new Promise(res => resolve = res);
 
-    if ( latestAlert ) {
-      clearTimeout(latestAlert);
+      if ( latestAlert ) {
+        clearTimeout(latestAlert);
+      }
+      latestAlert = setTimeout(() => {
+        resolve(confirm(msg));
+      }, ALERT_TIMEOUT);
+
+      return pr;
     }
-    latestAlert = setTimeout(() => {
-      resolve(confirm(msg));
-    }, ALERT_TIMEOUT);
-
-    return pr;
   }
 
   async function treload(sessionToken) {

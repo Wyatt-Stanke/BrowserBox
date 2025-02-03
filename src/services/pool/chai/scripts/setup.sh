@@ -5,6 +5,8 @@ if [ "$GITHUB_ACTIONS" == "true" ]; then
   exit 0
 fi
 
+sudo="$(command -v sudo)"
+
 . ~/.nvm/nvm.sh
 
 . ./scripts/config.sh
@@ -16,18 +18,18 @@ if [ "$OS" = "Darwin" ]; then
    cp policy.xml /opt/homebrew/etc/ImageMagick-*/
 elif [ "$OS" = "FreeBSD" ]; then
   # FreeBSD
-  sudo ./scripts/install_deps.sh
-  sudo mkdir -p /etc/ImageMagick
-  sudo cp policy.xml /etc/ImageMagick/
-  sudo cp policy.xml /etc/ImageMagick-*/
+  $sudo -E ./scripts/install_deps.sh
+  $sudo mkdir -p /etc/ImageMagick
+  $sudo cp policy.xml /etc/ImageMagick/
+  $sudo cp policy.xml /etc/ImageMagick-*/
 else
-  sudo ./scripts/nix_install_deps.sh
-  sudo mkdir -p /etc/ImageMagick
-  sudo cp policy.xml /etc/ImageMagick/
-  sudo cp policy.xml /etc/ImageMagick-*/
-  sudo apt-get update
-  sudo apt-get install libcap2-bin
-  sudo setcap 'cap_net_bind_service=+ep' "$(command -v node)"
+  $sudo -E ./scripts/nix_install_deps.sh
+  $sudo mkdir -p /etc/ImageMagick
+  $sudo cp policy.xml /etc/ImageMagick/
+  $sudo cp policy.xml /etc/ImageMagick-*/
+  $sudo $APT update
+  $sudo $APT install libcap2-bin
+  $sudo setcap 'cap_net_bind_service=+ep' "$(command -v node)"
 fi
 
 
@@ -42,11 +44,12 @@ fi
 npm i
 
 if ! command -v pm2 &>/dev/null; then
-  npm i -g pm2
-  if ! command -v pm2 &>/dev/null; then
-    echo "Error: could not install pm2" >&2
-    exit 1
+  . /etc/os-release
+
+  if [[ $ID == *"bsd" ]]; then
+    sudo -n npm i -g pm2@latest || echo "Could not install pm2" >&2
+  else
+    npm i -g pm2@latest
   fi
 fi
-
 

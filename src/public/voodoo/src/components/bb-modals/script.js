@@ -1,4 +1,5 @@
 class BBModal extends Base {
+  static MICRO_SLEEP = 30;
   RESPONDABLE_MODALS = new Set([
     'alert',
     'confirm',
@@ -19,8 +20,9 @@ class BBModal extends Base {
     this.prepareState();
   }
 
-  prepareState(currentModal = {}) {
+  prepareState(currentModal) {
     const state = this.state;
+    state._top.DEBUG.debugModal && console.log(`Call stack`, (new Error).stack);
     //super.prepareState();
     // these are default values when there is no current Modal
     let msg = '';
@@ -28,7 +30,7 @@ class BBModal extends Base {
     let title = '';
     let currentModalEl = false;
     let highlight = undefined;
-    let csrfToken = '';
+    let token = '';
     let requestId = '';
     let sessionId = '';
     let mode = '';
@@ -43,11 +45,12 @@ class BBModal extends Base {
 
     if ( currentModal ) {
       // the defaults here are defaults when there *is* a current modal
+      state._top.DEBUG.debugModal && console.log(`Prepare`, {currentModal});
       ({
-        msg:msg = 'Empty',
+        msg:msg = '2 Empty',
         type,
         highlight: highlight = false,
-        csrfToken:csrfToken = '',
+        token:token = '',
         url:url = '',
         title:title = 'Untitled',
         el:currentModalEl,
@@ -84,16 +87,17 @@ class BBModal extends Base {
       throw new TypeError(`Auth modal requires a requestId to send the response to`);
     }
 
-    if ( type == 'filechooser' && !(mode && sessionId && csrfToken) ) {
-      DEBUG.debugModal && console.log(currentModal);
-      throw new TypeError(`File chooser modal requires all of: sessionId, mode and csrfToken`);
+    if ( type == 'filechooser' && !(mode && sessionId && token) ) {
+      console.log({mode,sessionId,token});
+      state._top.DEBUG.debugModal && console.log(currentModal);
+      throw new TypeError(`File chooser modal requires all of: sessionId, mode and token`);
     }
 
     // we are getting this now via async fetch inside the HTML template ahahah
     /*
-    if ( type == 'settings' && !csrfToken ) {
+    if ( type == 'settings' && !token ) {
       DEBUG.debugModal && console.log(currentModal);
-      throw new TypeError(`Settings modal requires a csrfToken`);
+      throw new TypeError(`Settings modal requires a token`);
     }
     */
 
@@ -102,7 +106,7 @@ class BBModal extends Base {
     }
 
     currentModal = {
-      type, csrfToken, mode, requestId, msg,
+      type, token, mode, requestId, msg,
       highlight,
       el: state.viewState.ModalRef[type], 
       sessionId, otherButton, title, url, multiple, accept,
@@ -110,7 +114,7 @@ class BBModal extends Base {
       working, submitText, cancelText,
     };
 
-    DEBUG.debugModal && console.log('after prepare state', {currentModal}, '(also "others" state mixin)');
+    state._top.DEBUG.debugModal && console.log('after prepare state', {currentModal}, '(also "others" state mixin)');
 
     this.others = currentModal;
   }
@@ -121,17 +125,20 @@ class BBModal extends Base {
     const state = this.state;
     const {ModalRef} = state.viewState;
     const {
-      sessionId, mode, requestId, title, type, message:msg, defaultPrompt, url, otherButton,
+      sessionId, mode, requestId, title, type, message:msg, defaultPrompt, url, 
       link,
       highlight,
-      csrfToken,
+      token,
+    } = modal;
+    let {
+      otherButton,
     } = modal;
     if ( !ModalRef[type] ) { 
       DEBUG.debugModal && console.warn(`Waiting until modal type ${type} has its element loaded...`);
     }
     await state._top.untilTrue(() => !!ModalRef[type], 100, 1000);
-    const currentModal = {
-      type, csrfToken, mode, 
+    let currentModal = {
+      type, token, mode, 
       highlight, 
       requestId, 
       msg,
@@ -142,28 +149,39 @@ class BBModal extends Base {
       title, url
     };
     state.viewState.currentModal = currentModal;
-    this.prepareState(currentModal);
     localStorage.setItem('lastModal', JSON.stringify(modal));
 
     DEBUG.debugModal && console.log(state.viewState.currentModal);
 
-    const modalDebug = {
-      defaultPrompt, url, highlight, currentModal, ModalRef, state, title, type, otherButton, csrfToken,
-      link,
-    };
+    /*
+    while( state?.viewState?.currentModal?.el !== state?.viewState?.ModalRef?.notice ) {
+      DEBUG.debugModal && console.log(`Sleeping ${BBModal.MICRO_SLEEP} while we wait for state to be set...`);
+      this.state = state;
+      await sleep(BBModal.MICRO_SLEEP);
+    }
+    */
 
-    (DEBUG.debugModal || (DEBUG.val >= DEBUG.med)) && Object.assign(self, {modalDebug});
-
-    (DEBUG.debugModal || (DEBUG.val >= DEBUG.med)) && console.log(`Will display modal ${type} with ${msg} on el:`, state.viewState.currentModal.el);
-
-    this.state = state;
+    //DEBUG.debugModal && alert(`Modal should be shown`);
     setTimeout(async () => {
       if ( type == 'copy' ) {
-        await state._top.untilTrue(() => this.copyBoxTextarea.value == msg, 300, 20);
-        this.copyBoxTextarea.select();
-        navigator.clipboard.writeText(this.copyBoxTextarea.value);
-        const currentModal = {
-          type, csrfToken, mode, 
+        //this.copyBoxTextarea.select();
+        let secondTitle = '';
+        try {
+          DEBUG.debugClipboard && console.log(`Trying to copy`);
+          await navigator.clipboard.writeText(this.copyBoxTextarea.value);
+          DEBUG.debugClipboard && console.info(`Copied to clipboard`);
+          secondTitle = ' - Copied to Clipboard!';
+        } catch(e) {
+          DEBUG.debugClipboard && console.warn(`Could not copy to clipboard`, title);
+          this.latestCopyValue = this.copyBoxTextarea.value;
+          otherButton = {
+            title: 'Copy',
+            onClick: 'copyToClipboard',
+          };
+          secondTitle = ' - Click Copy';
+        }
+        currentModal = {
+          type, token, mode, 
           highlight, 
           requestId, 
           msg,
@@ -171,14 +189,36 @@ class BBModal extends Base {
           sessionId, 
           otherButton, 
           link,
-          title: title + ' - Copied to Clipboard!', 
+          title: title + secondTitle,
           url
         };
         state.viewState.currentModal = currentModal;
         this.prepareState(currentModal);
+        // weird hack don't know why we need this
+        this.copyBoxTitle.innerText = title + secondTitle;
         this.state = state;
       }
-    }, 0);
+    }, 32);
+    const modalDebug = {
+      defaultPrompt, url, highlight, currentModal, ModalRef, state, title, type, otherButton, token,
+      link,
+    };
+
+    (DEBUG.debugModal || (DEBUG.val >= DEBUG.med)) && Object.assign(self, {modalDebug});
+
+    (DEBUG.debugModal || (DEBUG.val >= DEBUG.med)) && console.log(`Will display modal ${type} with ${msg} on el:`, state.viewState.currentModal.el);
+    this.state = state;
+  }
+
+  copyToClipboard(event) {
+    // stop the modal from being closed by clicking this
+    event.stopPropagation();
+    // try to copy to clipboard
+    navigator.clipboard.writeText(this.latestCopyValue).then(
+      () => this.copyBoxTitle.innerText = 'Copied to Clipboard!'
+    ).catch(
+      () => this.copyBoxTitle.innerText = 'Copy failed. Please manually copy.'
+    );
   }
 
   closeModal(click) {
@@ -314,12 +354,16 @@ class BBModal extends Base {
     });
     this.prepareState(state.viewState.currentModal);
     this.state = state;
-    const resp = await fetch(form.action, request).then(r => r.json());
-    if ( resp.error ) {
-      alert(resp.error);
-    } else {
-      DEBUG.val && console.log(`Success attached files`, resp); 
-      console.log({resp});
+    try {
+      const resp = await uberFetch(form.action, request).then(r => r.json());
+      if ( resp.error ) {
+        alert(resp.error);
+      } else {
+        DEBUG.val && console.log(`Success attached files`, resp); 
+        DEBUG.val && console.log({resp});
+      }
+    } catch(e) {
+      console.warn("Error on file upload", e);
     }
     this.onlyCloseModal(click);
   }
@@ -342,7 +386,7 @@ class BBModal extends Base {
     });
     this.prepareState(state.viewState.currentModal);
     this.state = state;
-    const resp = await fetch(form.action, request).then(r => r.json());
+    const resp = await uberFetch(form.action, request).then(r => r.json());
     if ( resp.error ) {
       alert(`An error occurred`);
       console.log({resp});
@@ -389,3 +433,46 @@ class BBModal extends Base {
       }
   }
 }
+
+function approxEqual(s1, s2) {
+  // Calculate the Levenshtein distance between two strings
+  function levenshteinDistance(a, b) {
+    const matrix = [];
+
+    // Step 1: Initialize the distance matrix
+    for (let i = 0; i <= b.length; i++) {
+      matrix[i] = [i];
+    }
+    for (let j = 0; j <= a.length; j++) {
+      matrix[0][j] = j;
+    }
+
+    // Step 2: Populate the matrix based on minimum edit distance
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        if (b.charAt(i - 1) === a.charAt(j - 1)) {
+          matrix[i][j] = matrix[i - 1][j - 1];
+        } else {
+          matrix[i][j] = Math.min(
+            matrix[i - 1][j - 1] + 1,  // substitution
+            matrix[i][j - 1] + 1,      // insertion
+            matrix[i - 1][j] + 1       // deletion
+          );
+        }
+      }
+    }
+
+    return matrix[b.length][a.length];
+  }
+
+  // Compute the edit distance between the strings
+  const distance = levenshteinDistance(s1, s2);
+
+  // Normalize the distance by the maximum possible distance (longest string length)
+  const maxLength = Math.max(s1.length, s2.length);
+  const similarity = 1 - (distance / maxLength);
+
+  // Ensure similarity is always in the range [0, 1)
+  return similarity >= 1 ? 0.9999 : similarity;
+}
+

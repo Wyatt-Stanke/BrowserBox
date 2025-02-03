@@ -4,13 +4,19 @@ SUDO=""
 
 if command -v sudo; then
   SUDO="sudo"
+  if sudo -n true &>/dev/null; then
+    SUDO="sudo -n"
+  else
+    SUDO="sudo"
+  fi
 fi
 
 if command -v node; then
   echo "node installed"
 else
-  curl -fsSL https://deb.nodesource.com/setup_19.x | $SUDO -E bash - 
-  $SUDO apt-get install -y nodejs
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | $SUDO -E bash -
+  $SUDO bash -c "source ~/.nvm/nvm.sh; nvm install v22"
 fi
 
 if ! command -v pm2; then
@@ -20,10 +26,14 @@ fi
 $SUDO cp ./scripts/commands/* /usr/local/bin/
 
 # Edit the $SUDOers file to allow members of the "renice" group to run the "renice" command
-if ! $SUDO grep -q "%renice ALL=(ALL) NOPASSWD:" /etc/sudoers;
-then
+if ! $SUDO grep -q "%renice ALL=(ALL:renice) NOPASSWD:" /etc/sudoers; then
   $SUDO groupadd renice >&2
-  echo "%renice ALL=NOPASSWD: /usr/bin/renice, /usr/bin/loginctl, /usr/bin/id" | $SUDO tee -a /etc/$SUDOers >&2
+  echo "%renice ALL=(ALL:renice) NOPASSWD: /usr/bin/renice, /usr/bin/loginctl, /usr/bin/id" | $SUDO tee -a /etc/sudoers >&2
+fi
+if ! $SUDO grep -q "%browsers ALL=(ALL:browsers) NOPASSWD:" /etc/sudoers; then
+  $SUDO groupadd browsers >&2
+  echo "%browsers ALL=(ALL:browsers) NOPASSWD: /usr/bin/pulseaudio --start" | $SUDO tee -a /etc/sudoers >&2
+  echo "%browsers ALL=(ALL:browsers) NOPASSWD: /usr/bin/pulseaudio --start --use-pid-file=true --log-level=debug, /usr/bin/pulseaudio --check, /usr/bin/pacat" | $SUDO tee -a /etc/sudoers >&2
 fi
 
 

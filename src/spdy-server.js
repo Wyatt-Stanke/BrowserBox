@@ -1,7 +1,7 @@
   import express from 'express';
   import spdy from 'spdy';
   import fs from 'fs';
-  import zl from './zombie-lord/api.js';
+  import zl from './zombie-lord/index.js';
   import path from 'path';
   import bodyParser from 'body-parser';
   import {timedSend, eventSendLoop} from './server.js';
@@ -10,7 +10,7 @@
     key: fs.readFileSync(path.join(APP_ROOT, "certs", "server.key")),
     cert: fs.readFileSync(path.join(APP_ROOT, "certs", "server.crt")),
   };
-  const version = 'v1';
+  const version = 'v10';
 
   export async function start_spdy_server(port, zombie_port) {
     console.log(`Starting SPDY server on port ${port}`);

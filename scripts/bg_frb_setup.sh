@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-#sudo apt install -y nodejs npm
+#sudo $APT install -y nodejs npm
 sudo npm i -g npm node-dev serve 
-sudo apt install -y ethtool lshw psmisc htop libvips libjpeg-dev
+sudo $APT install -y ethtool lshw psmisc htop libvips libjpeg-dev
 ./installstats.sh
 ./install_bundle_deps.sh
 ./install_global_bundle_deps.sh
@@ -24,10 +24,10 @@ sudo groupadd browsers
 # not sure if we need it and it could be security risk 
 # as seems to give every app user sudo ability with browsers ? 
 #echo "You need to edit sudoers file with visudo to add"
-#echo "ALL ALL=(:browsers) NOPASSWD:ALL"
+#echo "%browsers ALL=(ALL:browsers) NOPASSWD: /usr/bin/pulseaudio"
 #read -p "Press enter to continue to visudo"
 #read | sudo visudo
-sudo apt install cpulimit cgroup-tools
+sudo $APT install cpulimit cgroup-tools
 ./cgroup-create.sh
 ./traffic-control.sh
 ./make_bundle.sh

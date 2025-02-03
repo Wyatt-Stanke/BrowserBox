@@ -10,6 +10,7 @@ import WebSocket from 'ws';
 //import {WebSocketServer} from 'ws';
 import compression from 'compression';
 import exitOnExpipe from 'exit-on-epipe';
+import rateLimit from 'express-rate-limit';
 
 import {
   DEBUG,
@@ -18,6 +19,7 @@ import {
   version,
   COOKIENAME,
   CONFIG,
+  untilTrueOrTimeout,
 } from '../../../common.js';
 
 DEBUG.debugDevtoolsServer && console.log(process.argv);
@@ -41,14 +43,20 @@ if ( ! PORT || ! COOKIE || ! TOKEN ) {
   );
 }
 
+try { 
+  process.title = "browserbox-devtools";
+} catch(e) {
+  console.info(`Could not set process title. Current title: ${process.title}`, e);
+}
+
 const SSL_OPTS = {};
 let GO_SECURE = true;
 try {
   Object.assign(SSL_OPTS, {
-    key: fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'privkey.pem')),
-    cert: fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'fullchain.pem')),
-    ca: fs.existsSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'chain.pem')) ? 
-      fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'chain.pem')) 
+    key: fs.readFileSync(path.resolve(CONFIG.sslcerts(PORT), 'privkey.pem')),
+    cert: fs.readFileSync(path.resolve(CONFIG.sslcerts(PORT), 'fullchain.pem')),
+    ca: fs.existsSync(path.resolve(CONFIG.sslcerts(PORT), 'chain.pem')) ? 
+      fs.readFileSync(path.resolve(CONFIG.sslcerts(PORT), 'chain.pem')) 
       : 
       undefined,
   });
@@ -58,8 +66,24 @@ try {
 }
 
 const SOCKETS = new Map();
+//const internalEndpointRegex = /ws=localhost(:\d+)?([^ "'<>,;)}\]`]+)/g;
+const internalEndpointRegex = /ws=localhost(:\d+)?([\/\w.-]+)/g;
+//const internalEndpointRegex = /ws=localhost/g;
+
+process.on('uncaughtException', err => { 
+  console.error(`Uncaught exception`, err);
+  process.exit(1);
+});
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000, // Limit each IP to 100 requests per `window` (here, per 15 minutes)
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
 
 const app = express();
+app.use(limiter);
 app.use(compression());
 app.use(express.urlencoded({extended:true}));
 app.use(cookieParser());
@@ -79,11 +103,12 @@ app.get('/login', (req, res) => {
     res.cookie(COOKIENAME+PORT, COOKIE, COOKIE_OPTS);
     authorized = true;
   } else {
-    const cookie = req.cookies[COOKIENAME+PORT];
+    const cookie = req.cookies[COOKIENAME+PORT] || req.headers['x-browserbox-local-auth'];
     authorized = (cookie === COOKIE) || NO_AUTH;
   }
   if ( authorized ) {
-    res.redirect('/');
+    const uri = req.query.nextUri  && ! process.env.TORBB ? decodeURIComponent(req.query.nextUri) : '/';
+    res.redirect(uri);
   } else {
     res.end(`
       <!DOCTYPE html>
@@ -121,13 +146,13 @@ app.get('/devtools_login.js', (req, res) => {
   res.sendFile(path.resolve('public', 'devtools_login.js'));
 });
 /**
-// comment this out to ensure our proxy (below) uses the latest version
-app.get('/devtools/inspector.html', (req, res) => {
-  res.sendFile(path.resolve('public', 'devtools', 'inspector.html'));
-});
-app.get('/devtools/inspector.js', (req, res) => {
-  res.sendFile(path.resolve('public', 'devtools', 'inspector.js'));
-});
+  // comment this out to ensure our proxy (below) uses the latest version
+  app.get('/devtools/inspector.html', (req, res) => {
+    res.sendFile(path.resolve('public', 'devtools', 'inspector.html'));
+  });
+  app.get('/devtools/inspector.js', (req, res) => {
+    res.sendFile(path.resolve('public', 'devtools', 'inspector.js'));
+  });
 **/
 app.get('/favicon.ico', (req, res) => {
   res.sendFile(path.resolve('public', 'favicon.ico'));
@@ -138,8 +163,8 @@ app.get('/favicon.svg', (req, res) => {
 app.get('/favicons/favicon.ico', (req, res) => {
   res.sendFile(path.resolve('public', 'favicons', 'favicon.ico'));
 });
-app.get('*', (req, res) => {
-  const cookie = req.cookies[COOKIENAME+PORT];
+app.get(/\/.*/, (req, res) => {
+  const cookie = req.cookies[COOKIENAME+PORT] || req.headers['x-browserbox-local-auth'];
   const authorized = (cookie === COOKIE) || NO_AUTH;
 
   if (authorized) {
@@ -152,10 +177,15 @@ app.get('*', (req, res) => {
     };
 
     DEBUG.debugDevtoolsServer && console.info(`Request authorized`, {resource});
-    const InternalEndpoint = /ws=localhost/g;
-    const ExternalEndpoint = req.query.ws || req.query.wss || `wss=${req.headers['host'].split(':')[0]}`;
 
-    DEBUG.debugDevtoolsServer && console.info({InternalEndpoint, ExternalEndpoint});
+    const WSUrl_Raw = req.query.ws || req.query.wss || req.headers['host'].split(':')[0]; 
+    const Frame = req.protocol == 'https' ? 'wss:' : 'ws:';
+    const WSUrl = new URL(`${Frame}//${WSUrl_Raw}`);
+    //WSUrl.searchParams.set('token', TOKEN);
+    const ExternalEndpoint = `${Frame.slice(0,-1)}=${encodeURIComponent(WSUrl.href.slice(Frame.length+2).replace(/\/$/, ''))}`
+    //const ExternalEndpoint = req.query.ws || req.query.wss || `wss=${req.headers['host'].split(':')[0]}`;
+
+    DEBUG.debugDevtoolsServer && console.info({internalEndpointRegex, ExternalEndpoint});
 
     // CRDP checks that host is localhost
     req.headers['host'] = `${'localhost'}:${PORT}`;
@@ -179,8 +209,17 @@ app.get('*', (req, res) => {
             );
             **/
 
-          if ( InternalEndpoint.test(Data.body) ) {
-            const newVal = Data.body.replace(InternalEndpoint, ExternalEndpoint);
+          if ( internalEndpointRegex.test(Data.body) ) {
+
+            const newVal = Data.body.replace(internalEndpointRegex, (match, port, capturedPart) => {
+              console.log('match', match);
+              // Construct the new URL using the captured part
+              //const result = `${ExternalEndpoint}`; //${capturedPart}/${encodeURIComponent(TOKEN)}`;
+              const result = `${ExternalEndpoint}${capturedPart}/${encodeURIComponent(TOKEN)}`;
+              console.log('result', result);
+              return result;
+            }); 
+
             // update content length
             destinationResponse.headers['content-length'] = newVal.length+'';
             DEBUG.debugDevtoolServer && console.log(destinationResponse.headers, req.url, Data.body.length);
@@ -230,6 +269,7 @@ app.get('*', (req, res) => {
 
     req.pipe(destination, {end: true});
   } else {
+    console.log('Request not authorized to proxy through devtools server');
     res.sendStatus(401);
   }
 });
@@ -238,39 +278,69 @@ const server = (GO_SECURE ? https : http).createServer(SSL_OPTS, app);
 
 const wss = new WebSocket.Server({server});
 
+// we should probably handle upgrade too to stop server crashing on a 404 websocket. weird
 wss.on('connection', (ws, req) => {
-  const cookie = req.headers.cookie;
-  const authorized = (cookie && cookie.includes(`${COOKIENAME+PORT}=${COOKIE}`)) || NO_AUTH;
-  DEBUG.debugDevtoolServer && console.log('connect', {cookie, authorized}, req.path, req.url);
-  if ( authorized ) {
-    const url = `ws://127.0.0.1:${CHROME_PORT}${req.url}`;
-    try {
-      const crdpSocket = new WebSocket(url);
-      SOCKETS.set(ws, crdpSocket);
-      crdpSocket.on('open', () => {
-        DEBUG.debugDevtoolServer && console.log('CRDP Socket open');
-      });
-      crdpSocket.on('message', msg => {
-        //console.log('Browser sends us message', msg);
-        ws.send(msg);
-      });
-      ws.on('message', msg => {
-        //console.log('We send browser message');
-        crdpSocket.send(msg);
-      });
-      ws.on('close', (code, reason) => {
-        SOCKETS.delete(ws);
-        crdpSocket.close(1001, 'client disconnected');
-      });
-      crdpSocket.on('close', (code, reason) => {
-        SOCKETS.delete(ws);
-        crdpSocket.close(1011, 'browser disconnected');
-      });
-    } catch(e) {
-      console.warn('Error on websocket creation', e);
+  try {
+    const cookie = req.headers.cookie || req.headers['x-browserbox-local-auth'];
+    const parts = req.url.split('/');
+    let token;
+    if ( parts.length == 5 ) {
+      token = parts.pop();
     }
-  } else {
-    ws.send(JSON.stringify({error:`Not authorized`}));
+    const path = parts.join('/');
+    const authorized = (cookie && cookie.includes(`${COOKIENAME+PORT}=${COOKIE}`)) || token == TOKEN || NO_AUTH;
+    DEBUG.debugDevtoolsServer && console.log('connect', {cookie, authorized, token, path, parts}, req.path, req.url);
+    if ( authorized ) {
+      const url = `ws://127.0.0.1:${CHROME_PORT}${path}`;
+      try {
+        let crdpSocket = new WebSocket(url);
+        SOCKETS.set(ws, crdpSocket);
+        ws.on('error', err => {
+          DEBUG.debugDevtoolServer && console.warn(`Front-end socket error`, err);
+        });
+        crdpSocket.on('error', err => {
+          DEBUG.debugDevtoolServer && console.warn(`CRDPSocket error`, err);
+        });
+        ws.on('open', () => {
+          DEBUG.debugDevtoolsServer && console.log('Front-end socket open');
+        });
+        crdpSocket.on('open', () => {
+          DEBUG.debugDevtoolsServer && console.log('CRDP Socket open');
+        });
+        crdpSocket.on('message', async msg => {
+          //console.log('Browser sends us message', msg);
+          if ( ws.readyState < WebSocket.OPEN ) {
+            await untilTrueOrTimeout(() => ws.readyState == WebSocket.OPEN, 150);
+          } 
+          ws.send(msg);
+        });
+        ws.on('message', async msg => {
+          //console.log('We send browser message');
+          if ( crdpSocket.readyState < WebSocket.OPEN ) {
+            await untilTrueOrTimeout(() => crdpSocket.readyState == WebSocket.OPEN, 150);
+          } 
+          crdpSocket.send(msg);
+        });
+        ws.on('close', (code, reason) => {
+          SOCKETS.delete(ws);
+          crdpSocket.close(1001, 'client disconnected');
+        });
+        crdpSocket.on('close', (code, reason) => {
+          SOCKETS.delete(ws);
+          ws.close(1011, 'browser disconnected');
+        });
+      } catch(e) {
+        console.warn('Error on websocket creation', e);
+      }
+    } else {
+      console.warn(`WS not authorized`);
+      if ( ws.readyState == WebSocket.OPEN ) {
+        ws.send(JSON.stringify({error:`Not authorized`}));
+      }
+      ws.close();
+    }
+  } catch(err) {
+    console.warn(`Error during ws connection`, err);
     ws.close();
   }
 });
@@ -284,4 +354,5 @@ server.listen(PORT, err => {
     throw err;
   }
   DEBUG.debugDevtoolsServer && console.log({crdpSecureProxyServer: { up: new Date, port: PORT }});
+  console.log({devtoolServer: {up: new Date, port: PORT}});
 });

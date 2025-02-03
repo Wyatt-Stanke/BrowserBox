@@ -6,34 +6,46 @@
   import child_process from 'child_process';	
 
   import express from 'express';
-  /* import fetch from 'node-fetch'; */
+  import compression from 'compression';
   import multer from 'multer';
   import {WebSocketServer, WebSocket} from 'ws';
   import Peer from 'simple-peer';
-  import WRTC from 'wrtc';
 
   import bodyParser from 'body-parser';
   import cookieParser from 'cookie-parser';
   import cors from 'cors';
   import helmet from 'helmet';
   import rateLimit from 'express-rate-limit';
-  import csrf from 'csurf';
-  //import {CWebp} from 'cwebp';
 
-  import zl from './zombie-lord/api.js';
+  import zl from './zombie-lord/index.js';
   import {start_mode} from './args.js';
   import {
+    AttachmentTypes,
+    StartupTabs,
+    OurWorld,
     T2_MINUTES,
     version, APP_ROOT, 
     COOKIENAME, GO_SECURE, DEBUG,
     CONFIG,
     ALLOWED_3RD_PARTY_EMBEDDERS,
+    BASE_PATH,
+    EXTENSIONS_PATH,
     throttle,
   } from './common.js';
   import {timedSend, eventSendLoop} from './server.js';
   import {MIN_TIME_BETWEEN_SHOTS, WEBP_QUAL} from './zombie-lord/screenShots.js';
 
+  const { exec, execSync } = child_process;
+
+  let WRTC;
+  try { 
+    await import('@roamhq/wrtc').then(module => WRTC = module.default);
+  } catch(e) {
+    console.warn(`webRTC not available on this platform (${process.platform}). You may wish to build the module @roamhq/wrtc yourself here.`);
+  }
+
   // config
+    const SHUTDOWN_MINUTES = 45 * 60 * 1000; // lol
     const SafariPlatform = /^((?!chrome|android).)*safari/i;
     const PEER_RECONNECT_MS = 2000;
     const FRAME_LIMIT = false; // 'SAMEORIGIN' or 'DENY' or false (no limit)
@@ -50,6 +62,14 @@
     Object.freeze(COOKIE_OPTS);
 
   DEBUG.debugCookie && console.log(COOKIE_OPTS);
+
+  if ( ! DEBUG.blockInspect ) {
+    console.warn(`
+        ===============================================
+               WARNING: Inspect is not blocked. 
+        ===============================================
+    `);
+  }
 
   // file uploads
     export const fileChoosers = new Map();
@@ -96,8 +116,15 @@
       `
     });
     
-    const ConstrainedRateLimiter = rateLimit({
-      windowMs: 10000,
+    const ConstrainedRateLimiter = rateLimit({ windowMs: 10000,
+      max: 1,
+      message: `
+        Too many requests from this IP. Please try again in a little while.
+      `
+    });
+    
+    const VeryConstrainedRateLimiter = rateLimit({
+      windowMs: 30000,
       max: 1,
       message: `
         Too many requests from this IP. Please try again in a little while.
@@ -121,20 +148,28 @@
   // keep tabs organized
   const TabNumbers = new Map();
 
-  export let LatestCSRFToken = '';
-  let notifyBandwidthIssue;
-  let BANDWIDTH_ISSUE_STATE = false;
+  // extensions
+  export const extensions = [];
+
+  let shutdownTimer = null;
   let serverOrigin;
   let messageQueueRunning = false;
   let requestId = 0;
   let TabNumber = 0;
 
-
   export async function start_ws_server(
       port, zombie_port, allowed_user_cookie, session_token, 
   ) {
+    if ( DEBUG.debugAddr ) {
+      const base = port - 2;
+      for( let i = base; i < base + 5; i++ ) {
+        const key = `ADDR_${i}`;
+        console.log(key, process.env[key]);
+      }
+    }
     DEBUG.val && console.log(`Starting websocket server on ${port}`);
     const app = express();
+    app.use(compression());
     const server_port = parseInt(port);
     const StandardCSP = {
       defaultSrc: ["'self'"],
@@ -144,27 +179,60 @@
         "blob:"
       ],
       mediaSrc: [
+        "data:",
         "'self'",
         "https://localhost:*",
         "https://*.dosyago.com:*",
-        "https://*.browserbox.pro:*",
+        "https://browse.cloudtabs.net:*",
+        ...(process.env.TORBB ? [
+          `https://${process.env[`ADDR_${server_port}`]}:*`, // main service (for data: urls seemingly)
+          `https://${process.env[`ADDR_${server_port - 2}`]}:*`, // audio onion service
+        ] : [
+          `https://${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+          `https://*.${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+        ])
       ],
       frameSrc: [
         "'self'",
         "https://localhost:*",
-        "https://*.browserbox.pro:*",
-        "https://*.dosyago.com:*"
+        "https://link.local:*",
+        "https://browse.cloudtabs.net:*",
+        "https://*.dosyago.com:*",
+        ...(process.env.TORBB ? [
+          `https://${process.env[`ADDR_${server_port - 2}`]}:*`, // audio onion service
+        ] : [
+          `https://*.${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+          `https://${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+        ])
       ],
       connectSrc: [
         "'self'",
         "wss://*.dosyago.com:*",
         "wss://localhost:*",
+        "wss://link.local:*",
         `https://*.dosyago.com:${server_port-1}`,
         `https://*.dosyago.com:${server_port+1}`,
-        "https://*.browserbox.pro:*",
-        "wss://*.browserbox.pro:*",
+        "https://browse.cloudtabs.net:*",
+        "https://browse.cloudtabs.net",
+        "wss://browse.cloudtabs.net:*",
         `https://localhost:${server_port-1}`,
-        `https://localhost:${server_port+1}`
+        `https://localhost:${server_port+1}`,
+        `https://link.local:${server_port-1}`,
+        `https://link.local:${server_port+1}`,
+        ...CONFIG.connectivityTests,
+        ...(process.env.TORBB ? [
+          `https://${process.env[`ADDR_${server_port}`]}:*`, // main service 
+          `https://${process.env[`ADDR_${server_port - 2}`]}:*`, // audio onion service
+          `https://${process.env[`ADDR_${server_port + 1}`]}:*`, // devtools
+          `https://${process.env[`ADDR_${server_port + 2}`]}:*`, // docs
+        ] : [
+          `https://${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+          `https://*.${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+          `wss://${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+          `wss://*.${process.env.DOMAIN}:*`, // main service (for data: urls seemingly)
+        ]),
+        // for checking if access via TOR
+        "https://check.torproject.org/"
       ],
       fontSrc: [
         "'self'", 
@@ -182,7 +250,7 @@
         "'self'", 
         "'unsafe-eval'",
         "'unsafe-inline'",
-        "https://*.browserbox.pro:*",
+        "https://browse.cloudtabs.net:*",
         "https://*.dosyago.com:*"
       ],
       scriptSrcAttr: [
@@ -191,7 +259,7 @@
       ],
       frameAncestors: [
         "'self'",
-        "https://*.browserbox.pro:*",
+        "https://browse.cloudtabs.net:*",
         "https://*.dosyago.com:*",
         ...ALLOWED_3RD_PARTY_EMBEDDERS
       ],
@@ -201,12 +269,6 @@
     const sockets = new Set();
     const websockets = new Set();
     const peers = new Set();
-    const notifyBandwidthIssue = throttle(function (bandwidthIssue) {
-      zl.act.fanOut(
-        socket => so(socket, {bandwidthIssue}), 
-        zombie_port
-      );
-    });
 
     let latestMessageId = 0;
 
@@ -232,10 +294,12 @@
               "'self'",
               "wss://*.dosyago.com:*",
               "wss://localhost:*",
+              "https://browse.cloudtabs.net",
               `https://*.dosyago.com:${server_port-1}`,
               `https://*.dosyago.com:${server_port+1}`,
               `https://localhost:${server_port-1}`,
-              `https://localhost:${server_port+1}`
+              `https://localhost:${server_port+1}`,
+              ...CONFIG.connectivityTests
             ],
             fontSrc: [
               "'self'", 
@@ -278,6 +342,9 @@
         },
         frameguard: FRAME_LIMIT
       }));
+      app.use(helmet.hsts({
+        maxAge: 0
+      }));
     }
     const CrossOriginSecure = helmet({
       crossOriginResourcePolicy: {
@@ -297,18 +364,16 @@
     app.use(bodyParser.json());
     app.use(cookieParser());
     app.use(upload.array("files", 10));
-    app.use(csrf({cookie: {sameSite: 'None', secure:true}}));
     app.use((req, res, next) => {
       const newOrigin = `${req.protocol}://${req.headers.host}`;
       if ( newOrigin !== serverOrigin ) {
         serverOrigin = newOrigin;
         DEBUG.showOrigin && console.log({serverOrigin});
       }
-      LatestCSRFToken = req.csrfToken();
       next();
     });
     // serve assets that can be injected into pages
-    app.get('/assets/*', OPEN_HEADERS, (req, res, next) => next());
+    app.get('/assets/*path', OPEN_HEADERS, (req, res, next) => next());
     if ( start_mode == "signup" ) {
       app.get("/", (req,res) => res.sendFile(path.join(APP_ROOT, 'public', 'index.html'))); 
     } else {
@@ -318,7 +383,7 @@
         app.get("/", SEC_HEADERS, (req,res) => res.sendFile(path.join(APP_ROOT, '..', 'dist', 'image.html'))); 
       }
       app.get("/login", SEC_HEADERS, (req,res) => {
-        console.log(req.query);
+        console.log('login', req.query);
         const {ui: ui = 'true',token,ran: ran = Math.random(),url:Url} = req.query; 
         DEBUG.debugCookie && console.log({token, session_token});
         if ( token == session_token ) {
@@ -326,17 +391,54 @@
           DEBUG.debugCookie && console.log('set cookie', COOKIENAME+port, allowed_user_cookie, COOKIE_OPTS);
           let url;
           url = `/?ran=${ran||Math.random()}&ui=${ui}#${session_token}`;
-          if ( !! Url ) {
+          if ( process.env.TORBB ) {
+            const zVal = encodeURIComponent(btoa(JSON.stringify({
+              x: process.env[`ADDR_${server_port-2}`],  // audio port onion service
+              y: process.env[`ADDR_${server_port+1}`],  // devtools port onion service
+            })));
+            if ( !! Url ) {
+              url = `/?url=${encodeURIComponent(Url)}&z=${zVal}&ran=${ran||Math.random()}&ui=${ui}#${session_token}`;
+            } else {
+              url = `/?ran=${ran||Math.random()}&z=${zVal}&ui=${ui}#${session_token}`;
+            }
+          } else if ( !! Url ) {
             url = `/?url=${encodeURIComponent(Url)}&ran=${ran||Math.random()}&ui=${ui}#${session_token}`;
-          } 
+          }
           console.log({url});
           const userAgent = req.headers['user-agent'];
           const isSafari = SafariPlatform.test(userAgent);
-          if ( isSafari ) {
+          if ( isSafari && DEBUG.ensureRSA_for_3PC ) { // ensure request storage access for 3rd-party cookies
             res.type('html');
             res.end(SafariPermissionLoader());
           } else {
             res.redirect(url);
+          }
+        } else {
+          res.type("html");
+          res.status(401);
+          if ( session_token == 'token2' ) {
+            res.end(`Incorrect token, not token2. <a href=/login?token=token2>Try again.</a>`);
+          } else {
+            res.end(`Incorrect token. <a href=https://${req.hostname}/>Try again.</a>`);
+          }
+        }
+      }); 
+      app.get("/local_cookie.js", SEC_HEADERS, (req,res) => {
+        console.log('local cookie', req.query);
+        const {ui: ui = 'true',token,ran: ran = Math.random(),url:Url} = req.query; 
+        DEBUG.debugCookie && console.log({token, session_token});
+        if ( token == session_token ) {
+          res.type('application/javascript');
+          const userAgent = req.headers['user-agent'];
+          const isSafari = SafariPlatform.test(userAgent);
+          if ( isSafari || DEBUG.useLocalAuthInPrepFor_3PC_PhaseOut ) {
+            res.send(`
+              localStorage.setItem('localCookie',"${allowed_user_cookie}");
+            `);
+          } else {
+            res.send(`
+              void 0;
+            `);
           }
         } else {
           res.type("html");
@@ -346,7 +448,7 @@
             res.end(`Incorrect token. <a href=https://${req.hostname}/>Try again.</a>`);
           }
         }
-      }); 
+      });
       app.get("/SPLlogin", (req,res) => {
         const {token,ran,url:Url} = req.query; 
         if ( token == session_token ) {
@@ -378,6 +480,11 @@
         res.sendFile(path.resolve(APP_ROOT,...(DEBUG.mode === 'dev' ? ['public', 'assets'] : ['..', 'dist', 'assets']),'SPL2.html'));
       });
     }
+    /*
+    if ( process.env.TORBB ) {
+      app.get("/torca/rootCA.pem", (req, res) => res.sendFile(path.resolve(process.env.TORCA_CERT_ROOT, 'rootCA.pem')));
+    }
+    */
     app.use(express.static(path.resolve(APP_ROOT, ...(DEBUG.mode === 'dev' ? ['public'] : ['..', 'dist']))));
 
     try {
@@ -389,20 +496,22 @@
     const secure_options = {};
     try {
       const sec = {
-        key: fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'privkey.pem')),
-        cert: fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'fullchain.pem')),
-        ca: fs.existsSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'chain.pem')) ? 
-            fs.readFileSync(path.resolve(os.homedir(), CONFIG.sslcerts, 'chain.pem'))
+        key: fs.readFileSync(path.resolve(CONFIG.sslcerts(server_port), 'privkey.pem')),
+        cert: fs.readFileSync(path.resolve(CONFIG.sslcerts(server_port), 'fullchain.pem')),
+        ca: fs.existsSync(path.resolve(CONFIG.sslcerts(server_port), 'chain.pem')) ? 
+            fs.readFileSync(path.resolve(CONFIG.sslcerts(server_port), 'chain.pem'))
           :
             undefined
       };
       Object.assign(secure_options, sec);
     } catch(e) {
       console.warn(`No certs found so will use insecure no SSL.`); 
+      console.log(secure_options, CONFIG.sslcerts(server_port));
     }
 
     const secure = secure_options.cert && secure_options.key;
     const server = protocol.createServer.apply(protocol, GO_SECURE && secure ? [secure_options, app] : [app]);
+
     const wss = new WebSocketServer({
       server,
       perMessageDeflate: false
@@ -451,84 +560,69 @@
       const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
       const qp = url.searchParams.get('session_token');
       const cookie = req.headers.cookie;
+      let query;
+      try {
+        query = new URL(req.url).searchParams;
+      } catch(e) {
+        query = new URL(`https://localhost${req.url}`).searchParams;
+      }
+      const localCookie = url.searchParams.get(COOKIENAME+port) || req.headers['x-browserbox-local-auth'] || query.get('localCookie');
       const IP = req.connection.remoteAddress;
       let closed = false;
 
-      DEBUG.val && console.log({wsConnected:{cookie, qp, IP}});
+      DEBUG.val && console.log({wsConnected:{cookie, localCookie, qp, IP}});
 
       zl.act.saveIP(IP);
 
       const validAuth = (cookie && cookie.includes(`${COOKIENAME+port}=${allowed_user_cookie}`)) ||
-        (qp && qp == session_token);
+        (qp && qp == session_token) || (localCookie == allowed_user_cookie);
 
       if( validAuth ) {
         DEBUG.debugConnect && console.log(`Check 1`);
-        await zl.act.addLink(so, {connectionId, fastest: null, peer: null, socket:ws}, zombie_port);
+        await zl.act.addLink({so, forceMeta}, {connectionId, fastest: null, peer: null, socket:ws}, zombie_port);
         DEBUG.debugConnect && console.log(`Check 2`);
-        zl.act.fanOut(socket => so(
-          socket,
-          {
-            meta:[
-              {
-                multiplayer: {
-                  onlineCount: zl.act.linkStats(zombie_port).onlineCount
-                }
-              }
-            ]
+        forceMeta({
+          multiplayer: {
+            onlineCount: zl.act.linkStats(zombie_port).onlineCount
           }
-        ), zombie_port);
+        });
+        stopShutdownTimer();
         DEBUG.debugConnect && console.log(`Check 3`);
         let peer;
-        if ( DEBUG.useWebRTC ) {
-          connectPeer();
-
-          function connectPeer() {
-            DEBUG.debugConnect && console.log(`Check 4`);
-            peer = new Peer({
-              wrtc: WRTC, trickle: true, initiator: true,
-              channelConfig: {
-                ordered: true,
-                maxRetransmits: 0,
-                /*maxPacketLifeTime: MIN_TIME_BETWEEN_SHOTS*/
-              }
-            });
-            DEBUG.debugConnect && console.log(`Check 5`);
-            peer.on('error', err => {
-              DEBUG.val && console.log('webrtc error', err);
-              if ( peer ) {
-                peers.delete(peer);
-                peer = null;
-                zl.act.addLink(so, {connectionId, peer: null, socket:ws}, zombie_port);
-                if ( ws?.readyState < WebSocket.CLOSING ) {
-                  setTimeout(connectPeer, PEER_RECONNECT_MS);
-                }
-              }
-            });
-            peer.on('close', c => {
-              DEBUG.val && console.log('peer closed', c);
-              if ( peer ) {
-                peers.delete(peer);
-                peer = null;
-                zl.act.addLink(so, {connectionId, peer: null, socket:ws}, zombie_port);
-                if ( ws?.readyState < WebSocket.CLOSING ) {
-                  setTimeout(connectPeer, PEER_RECONNECT_MS);
-                }
-              }
-            });
-            peer.on('connect', () => {
-              DEBUG.cnx && console.log('peer connected');
-              //setTimeout(() => zl.act.addLink(so, {connectionId, peer, socket:ws}, zombie_port), 15000);
-              zl.act.addLink(so, {connectionId, peer, socket:ws}, zombie_port);
-            });
-            peer.on('signal', data => {
-              DEBUG.cnx && console.log(`have webrtc signal data. sending to client`, data);
-              so(ws, {copeer:{signal:data}});
-              peers.add(peer);
-            });
-          }
-        }
-        zl.life.onDeath(zombie_port, () => {
+        zl.life.onDeath(zombie_port,  () => {
           console.info("Zombie/chrome closed or crashed.");
+          zl.act.deleteConnection(zombie_port);
+          if ( fs.existsSync(path.join(os.homedir(), 'restart_chrome')) ) {
+            fs.unlinkSync(path.join(os.homedir(), 'restart_chrome'));
+            console.log(`Restarting chrome on request`);
+            const MAX_RETRIES = 10;
+            let count = 0;
+
+            restart();
+
+            async function restart() {
+              let port;
+              try {
+                ({port} = await zl.life.newZombie({port: zombie_port})); 
+              } catch(e) {
+                console.warn(`Error starting chrome`);
+                zl.life.kill(zombie_port);
+              }
+              if ( port != zombie_port ) {
+                console.log(`Zombie port mismatch`, {zombie_port, acquired_port: port});
+                if ( port ) { 
+                  zl.life.kill(port);
+                }
+                await sleep(500);
+                if ( count++ < MAX_RETRIES ) {
+                  console.log(`Retrying...`);
+                  setTimeout(() => restart(), 0);
+                } else {
+                  console.warn(new Error(`Failed to restart chrome. Retry count exceeded`));
+                }
+              }
+            }
+          }
           //console.log("Closing as zombie crashed.");
           //ws.close();
         });
@@ -538,8 +632,12 @@
           closed = true;    
           ws = null;
           peer && peer.destroy(new Error(`Main communication WebSocket closed.`));
+          console.log(`Clients connected now: ${websockets.size}`);
+          if ( websockets.size === 0 ) {
+            startShutdownTimer();
+          }
           peer = null;
-          zl.act.addLink(so, {connectionId, peer: null, socket:null}, zombie_port);
+          zl.act.addLink({so, forceMeta}, {connectionId, peer: null, socket:null}, zombie_port);
           zl.act.deleteLink({connectionId}, zombie_port);
           zl.act.fanOut(socket => so(
             socket,
@@ -567,7 +665,8 @@
 
             DEBUG.cnx && console.log(message);
 
-            const {fastestChannel, screenshotAck, copeer, zombie, tabs, messageId} = message;  
+            const {fastestChannel, copeer, zombie, tabs, messageId, viewport} = message;  
+            let {screenshotAck} = message;
 
             latestMessageId = messageId;
 
@@ -576,21 +675,28 @@
                 if ( DEBUG.chooseFastest ) { 
                   if ( fastestChannel.websocket ) {
                     DEBUG.logFastest && console.log(`Fastest is websocket`);
-                    zl.act.addLink(so, {connectionId, fastest: ws, peer, socket:ws}, zombie_port);
+                    zl.act.addLink({so, forceMeta}, {connectionId, fastest: ws, peer, socket:ws}, zombie_port);
                   } else if ( fastestChannel.webrtcpeer ) {
                     DEBUG.logFastest && console.log(`Fastest is webrtc`);
-                    zl.act.addLink(so, {connectionId, fastest: peer, peer, socket:ws}, zombie_port);
+                    zl.act.addLink({so, forceMeta}, {connectionId, fastest: peer, peer, socket:ws}, zombie_port);
                   } else {
                     console.warn(`Unknown fastest channel`, fastestChannel);
                   }
                 }
               } 
               if ( screenshotAck ) {
-                DEBUG.acks && console.log('client sent screenshot ack', messageId, screenshotAck);
-                const {bandwidthIssue} = zl.act.screenshotAck(connectionId, zombie_port, screenshotAck, {Data, Frames, Meta, State, receivesFrames: false, messageId});
-                if ( bandwidthIssue != BANDWIDTH_ISSUE_STATE ) {
-                  BANDWIDTH_ISSUE_STATE = bandwidthIssue;
-                  notifyBandwidthIssue(bandwidthIssue);
+                (DEBUG.debugCast || DEBUG.acks) && console.log('client sent screenshot ack', screenshotAck);
+                if ( screenshotAck == 1 ) {
+                  (DEBUG.debugCast || DEBUG.acks) && console.log('client sent screenshot no frame received code');
+                  screenshotAck = { frameId: 1, requiresCastId: true }
+                } 
+                if ( !screenshotAck.requiresCastId || DEBUG.allowAckBlastOnStart ) {
+                  zl.act.screenshotAck(
+                    connectionId, 
+                    zombie_port, 
+                    screenshotAck, 
+                    {Data, Frames, Meta, State, receivesFrames: false, messageId}
+                  );
                 }
               }
               if ( zombie ) {
@@ -659,7 +765,10 @@
                   name: "Target.getTargets",
                   params: {
                     filter: [
-                      {type: 'page'}
+                      {type: 'page'},
+                      ...(DEBUG.attachToServiceWorkers ? [
+                        {type: 'service_worker'}
+                      ] : []),
                     ]
                   },
                 }, zombie_port);
@@ -667,9 +776,28 @@
                 if ( targets.length === 1 ) {
                   zl.act.setHiddenTarget(targets[0].targetId, zombie_port);
                 }
-                targets = targets.filter(({targetId,type}) => { 
-                  if ( type !== 'page' ) return false;
-                  if ( ! zl.act.hasSession(targetId, zombie_port) ) return false;
+                targets = targets.filter(({targetId,type,url}) => { 
+                  if ( !AttachmentTypes.has(type) ) return false;
+                  /*
+                  if ( url.startsWith('chrome') ) {
+                    return false;
+                  }
+                  */
+                  if ( ! zl.act.hasSession(targetId, zombie_port) ) {
+                    if ( DEBUG.restoreSessions ) { 
+                      DEBUG.restore && console.info(`Sent 'attach' to tab target ${targetId}`);
+                      StartupTabs.add(targetId);
+                      zl.act.send({
+                        name: "Target.attachToTarget",
+                        params: {
+                          targetId,
+                          flatten: true
+                        }
+                      }, zombie_port);
+                    } else {
+                      return false;
+                    }
+                  }
                   return true;
                 });
                 targets = targets.map(t => {
@@ -692,8 +820,16 @@
               if ( copeer ) {
                 const {signal} = copeer;
                 DEBUG.cnx && console.log('Received webrtc signal data from socket', copeer); 
-                peer.signal(signal);
+                if ( ! peer && DEBUG.useWebRTC ) {
+                  connectPeer().then(peer => peer.signal(signal));
+                } else {
+                  peer.signal(signal);
+                }
               } 
+              if ( viewport ) {
+                DEBUG.showViewportChanges && console.log(`Viewport received`, viewport);
+                zl.act.setViewport(connectionId, viewport, zombie_port);
+              }
             } catch(e) {
               console.error("Error", IP, connectionId, e);
               // errors are not always pushed up this far
@@ -714,8 +850,63 @@
         ws.on('error', err => {
           DEBUG.debugConnect && console.log(`Check 10`);
           console.log(`ws err`, err);
+          websockets.delete(ws);
+          if ( websockets.size === 0 ) {
+            startShutdownTimer();
+          }
         });
         DEBUG.debugConnect && console.log(`Check 11`);
+        if ( DEBUG.useWebRTC ) {
+          connectPeer();
+        }
+        function connectPeer() {
+          DEBUG.debugConnect && console.log(`Check 4`);
+          let resolve;
+          const pr = new Promise(res => resolve = res);
+          peer = new Peer({
+            wrtc: WRTC, trickle: true, initiator: true,
+            channelConfig: {
+              ordered: true,
+              maxRetransmits: 0,
+              /*maxPacketLifeTime: MIN_TIME_BETWEEN_SHOTS()*/
+            }
+          });
+          DEBUG.debugConnect && console.log(`Check 5`);
+          peer.on('error', err => {
+            DEBUG.val && console.log('webrtc error', err);
+            if ( peer ) {
+              peers.delete(peer);
+              peer = null;
+              zl.act.addLink({so, forceMeta}, {connectionId, peer: null, socket:ws}, zombie_port);
+              if ( ws?.readyState < WebSocket.CLOSING ) {
+                setTimeout(connectPeer, PEER_RECONNECT_MS);
+              }
+            }
+          });
+          peer.on('close', c => {
+            DEBUG.val && console.log('peer closed', c);
+            if ( peer ) {
+              peers.delete(peer);
+              peer = null;
+              zl.act.addLink({so, forceMeta}, {connectionId, peer: null, socket:ws}, zombie_port);
+              if ( ws?.readyState < WebSocket.CLOSING ) {
+                setTimeout(connectPeer, PEER_RECONNECT_MS);
+              }
+            }
+          });
+          peer.on('connect', () => {
+            DEBUG.cnx && console.log('peer connected');
+            //setTimeout(() => zl.act.addLink({so, forceMeta}, {connectionId, peer, socket:ws}, zombie_port), 15000);
+            zl.act.addLink({so, forceMeta}, {connectionId, peer, socket:ws}, zombie_port);
+            resolve(peer);
+          });
+          peer.on('signal', data => {
+            DEBUG.cnx && console.log(`have webrtc signal data. sending to client`, data);
+            so(ws, {copeer:{signal:data}});
+            peers.add(peer);
+          });
+          return pr;
+        }
 
         // send favicons to client
         zl.act.sendFavicons(msg => so(ws, msg), zombie_port);
@@ -772,15 +963,23 @@
     process.on('SIGUSR2', shutDown);
     process.on('beforeExit', shutDown);
     process.on('exit', shutDown);
+
+    DEBUG.alwaysStartShutdownTimer && startShutdownTimer();
+
     return server;
 
     function addHandlers() {
+      const CACHE_EXPIRY = 3 * 60 * 1000;
+      let torExitList;
+      let cachExpired = true;
       // core app interface functions
         app.get(`/api/${version}/tabs`, wrap(async (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
           DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
           DEBUG.debugCookie && console.log('all cookies', req.cookies);
-          if ( (cookie !== allowed_user_cookie) ) {
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
             return res.status(401).send('{"err":"forbidden"}');
           }
           requestId++;
@@ -793,7 +992,10 @@
               name: "Target.getTargets",
               params: {
                 filter: [
-                  {type: 'page'}
+                  {type: 'page'},
+                  ...(DEBUG.attachToServiceWorkers ? [
+                    {type: 'service_worker'}
+                  ] : []),
                 ]
               },
             }, zombie_port));
@@ -802,9 +1004,28 @@
               if ( targets?.length === 1 ) {
                 zl.act.setHiddenTarget(targets[0].targetId, zombie_port);
               }
-              targets = targets.filter(({targetId,type}) => { 
-                if ( type !== 'page' ) return false;
-                if ( ! zl.act.hasSession(targetId, zombie_port) ) return false;
+              targets = targets.filter(({targetId,type,url}) => { 
+                if ( !AttachmentTypes.has(type) ) return false;
+                /*
+                if ( url.startsWith('chrome') ) {
+                  return false;
+                }
+                */
+                if ( ! zl.act.hasSession(targetId, zombie_port) ) {
+                  if ( DEBUG.restoreSessions ) { 
+                    DEBUG.restore && console.info(`Sent 'attach' to tab target ${targetId}`);
+                    StartupTabs.add(targetId);
+                    zl.act.send({
+                      name: "Target.attachToTarget",
+                      params: {
+                        targetId,
+                        flatten: true
+                      }
+                    }, zombie_port);
+                  } else {
+                    return false;
+                  }
+                }
                 return true;
               });
               targets = targets.map(t => {
@@ -828,45 +1049,172 @@
             /*throw e;*/
           }
         }));
-        app.post("/file", async (req,res) => {
-          const cookie = req.cookies[COOKIENAME+port];
-          if ( (cookie !== allowed_user_cookie) ) { 
+        app.get(`/extensions`, VeryConstrainedRateLimiter, (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
             return res.status(401).send('{"err":"forbidden"}');
           }
+          res.set('Cache-Control', 'public, max-age=13');
+          populateExtensions();
+          return res.send({extensions});
+        });
+        app.get(`/isTor`, (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
+            return res.status(401).send('{"err":"forbidden"}');
+          }
+          const data = {};
+          if ( CONFIG.useTorProxy ) {
+            data.isTor = true;
+          } else {
+            data.isTor = false;
+          }
+          res.end(JSON.stringify(data));
+        });
+        app.get(`/torExit`, wrap(async (req, res) => {
+          res.type('json');
+          const data = {};
+          let error;
+
+          let clientIP = req.ip || req.connection.remoteAddress;
+
+          clientIP = clientIP.replace('::ffff:', '');
+            
+          try {
+            if ( ! torExitList || cacheExpired ) {
+              cacheExpired = false;
+              torExitList = await fetch('https://check.torproject.org/torbulkexitlist').then(r => r.text());
+              setTimeout(() => cacheExpired = true, CACHE_EXPIRY);
+            }
+            const torExitSet = new Set(
+              torExitList
+                .split(/\n/g)
+                .map(line => line.trim())
+                .filter(line => line.length)
+            );
+            data.status = torExitSet.has(clientIP) ? 'tor-exit' : 'non-tor-exit';
+          } catch(error) {
+            data.error = error;
+          }
+
+          res.end(JSON.stringify(data));
+        }));
+        app.get(`/isSubscriber`, (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
+            return res.status(401).send('{"err":"forbidden"}');
+          }
+          const data = {};
+          if ( CONFIG.isSubscriber ) {
+            data.isSubscriber = true;
+          } else {
+            data.isSubscriber = false;
+          }
+          res.end(JSON.stringify(data));
+        });
+        app.get(`/expiry_time`, (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
+            return res.status(401).send('{"err":"forbidden"}');
+          }
+          const data = {};
+          if ( CONFIG.isSubscriber ) {
+            data.expiry_time = 0;
+          } else {
+            try {
+              data.expiry_time = fs.readFileSync(CONFIG.expiryTimeFilePath).toString().trim();
+            } catch(e) {
+              console.info(`Cannot read expiry time`);
+              DEBUG.showFileErrors && console.warn(e);
+              data.expiry_time = 0;
+            }
+          }
+          res.end(JSON.stringify(data));
+        });
+        app.get("/settings_modal", (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const st = req.query.sessionToken;
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          if ( (cookie !== allowed_user_cookie) && st !== session_token ) {
+            return res.status(401).send('{"err":"forbidden"}');
+          }
+          res.status(200).send(` 
+            <form method=POST target=results>
+              <fieldset>
+                <button formaction=/restart_app>Restart app</button>
+                <button formaction=/stop_app>Stop app</button>
+                <button formaction=/stop_browser>Stop browser</button>
+              </fieldset>
+            </form>
+            <iframe style=display:none name=results>
+          `);
+        });
+        app.post("/file", async (req,res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          const {token} = req.body;
+          DEBUG.fileDebug && console.log(req.files, req.body, {token});
+          if ( (cookie !== allowed_user_cookie) && token != session_token ) { 
+            DEBUG.debugFileUpload && console.log(`Request for file upload forbidden.`, req.files);
+            return res.status(401).send('{"err":"forbidden"}');
+          }
+          DEBUG.fileDebug && console.log(req.files, req.body, {token});
           const {files} = req;
-          const {sessionid:sessionId} = req.body;
+          const sessionId = req.body.sessionid || req.body.sessionId;
+          const contextId = OurWorld.get(sessionId);
           const backendNodeId = fileChoosers.get(sessionId);
+          DEBUG.debugFileUpload && console.log('File choosers get', fileChoosers, `sessionId: ${sessionId}`, {backendNodeId});
           const action = ! files || files.length == 0 ? 'cancel' : 'accept';
-          /**
           const fileInputResult = await zl.act.send({
             name:"Runtime.evaluate",
             params: {
-              expression: "self.zombieDosyLastClicked.fileInput"
+              expression: "self.zombieDosyLastClicked.fileInput",
+              contextId,
             }, 
             definitelyWait: true,
             sessionId
           }, zombie_port);
-          console.log({fileInputResult, s:JSON.stringify(fileInputResult)});
-          const objectId = fileInputResult.data.result.objectId;
-          **/
-          const command = {
-            name: "DOM.setFileInputFiles",
-            params: {
-              files: files && files.map(({path}) => path),
-              backendNodeId
-            },
-            sessionId
-          };
-          DEBUG.val > DEBUG.med && console.log("We need to send the right command to the browser session", files, sessionId, action, command);
+          DEBUG.debugFileUpload && console.log({fileInputResult, s:JSON.stringify(fileInputResult)});
+          const objectId = fileInputResult?.data?.result?.objectId;
           let result;
-          
-          try {
-            result = await zl.act.send(command, zombie_port);
-          } catch(e) {
-            console.log("Error sending file input command", e);
+            
+          if ( objectId || backendNodeId ) {
+            const command = {
+              name: "DOM.setFileInputFiles",
+              params: {
+                files: files && files.map(({path}) => path),
+                backendNodeId,
+                objectId,
+              },
+              sessionId
+            };
+            DEBUG.debugFileUpload && console.log("We need to send the right command to the browser session", files, sessionId, action, command);
+            try {
+              result = await zl.act.send(command, zombie_port);
+            } catch(e) {
+              console.log("Error sending file input command", e);
+            }
+          } else {
+            result = {error: fileInputResult.data.exceptionDetails || 'unknown error'}
           }
 
-          DEBUG.val > DEBUG.med && console.log({fileResult:result});
+          DEBUG.debugFileUpload && console.log(JSON.stringify({fileResult:result}, null, 2));
 
           if ( !result || result.error ) {
             res.status(500).send(JSON.stringify({error:'there was an error attaching the files'}));
@@ -878,27 +1226,26 @@
             DEBUG.val > DEBUG.med && console.log("Sent files to file input", result, files);
             res.json(result);
           }
+          forceMeta({fileChooserClosed:{sessionId}});
+          DEBUG.fileDebug && console.log('force meta called');
         }); 
-        app.get("/settings_modal", (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
-          if ( (cookie !== allowed_user_cookie) ) { 
+      // fun / extra app data getters
+        app.get('/tabs/:tabId', wrap(async (req, res) => {
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
+          DEBUG.debugCookie && console.log('look for cookie', COOKIENAME+port, 'found: ', {cookie, allowed_user_cookie});
+          DEBUG.debugCookie && console.log('all cookies', req.cookies);
+          res.type('json');
+          if ( (cookie !== allowed_user_cookie) ) {
             return res.status(401).send('{"err":"forbidden"}');
           }
-          res.status(200).send(` 
-            <form method=POST target=results>
-              <input type=hidden name=_csrf value=${LatestCSRFToken}>
-              <fieldset>
-                <button formaction=/restart_app>Restart app</button>
-                <button formaction=/stop_app>Stop app</button>
-                <button formaction=/stop_browser>Stop browser</button>
-              </fieldset>
-            </form>
-            <iframe style=display:none name=results>
-          `);
-        });
+          const data = await runCurl(`curl http://${DEBUG.useLoopbackIP ? '127.0.0.1' : 'localhost'}:${zombie_port}/json`);
+          const targets = JSON.parse(data);
+          const target = targets.filter(({id:t}) => t == req.params.tabId);
+          res.send(JSON.stringify({target},null,2));
+        }));
       // app meta controls
         app.post("/restart_app", ConstrainedRateLimiter, (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
           const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
           const qp = url.searchParams.get('session_token');
           if ( (cookie !== allowed_user_cookie) && qp != session_token ) { 
@@ -955,7 +1302,7 @@
           return res.status(200).send("requested");
         });
         app.post("/stop_app", ConstrainedRateLimiter, (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
           const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
           const qp = url.searchParams.get('session_token');
           if ( (cookie !== allowed_user_cookie) && qp != session_token ) { 
@@ -971,7 +1318,7 @@
           if ( process.env.PM2_USAGE && process.env.name ) {
             DEBUG.debugRestart && console.log(`Is pm2. Deleting pm2 name`, process.env.name);
             try {
-              console.log(child_process.execSync(`pm2 delete ${process.env.name}`).toString());
+              return executeShutdownOfBBPRO();
             } catch(e) {
               console.warn(e);
             }
@@ -981,7 +1328,7 @@
           }
         });
         app.post("/stop_browser", async (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
           const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
           const qp = url.searchParams.get('session_token');
           if ( (cookie !== allowed_user_cookie) && qp != session_token ) { 
@@ -993,7 +1340,7 @@
           await zl.life.kill(zombie_port);
         });
         app.post("/start_browser", (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
           const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
           const qp = url.searchParams.get('session_token');
           if ( (cookie !== allowed_user_cookie) && qp != session_token ) { 
@@ -1002,10 +1349,11 @@
           /**
             launch a new browser (if one is not running)
           **/
+          throw new Error(`Not implemented`);
         });
       // app integrity check
         app.get("/integrity", ConstrainedRateLimiter, (req, res) => {
-          const cookie = req.cookies[COOKIENAME+port];
+          const cookie = req.cookies[COOKIENAME+port] || req.query[COOKIENAME+port] || req.headers['x-browserbox-local-auth'];
           const url = new URL(req.url, `${req.protocol}://${req.headers.host}`);
           const qp = url.searchParams.get('session_token');
           if ( (cookie !== allowed_user_cookie) && qp != session_token ) { 
@@ -1015,7 +1363,7 @@
           res.status(200).send(INTEGRITY_FILE_CONTENT);
         });
       // error handling middleware
-        app.use('*', (err, req, res, next) => {
+        app.use('/*path', (err, req, res, next) => {
           try {
             res.type('json');
           } finally {
@@ -1035,6 +1383,17 @@
         });
     }
 
+    function forceMeta(...metas) {
+      zl.act.fanOut(socket => so(
+        socket,
+        {
+          meta:[
+            ...metas
+          ]
+        }
+      ), zombie_port);
+    }
+
     function so(socket, message) {
       if ( !message ) return;
 
@@ -1052,16 +1411,18 @@
         message;
       } else {
         if ( message.data ) {
-          message.data = message.data.filter(x => !!x);
+          message.data = message.data.filter(x => !!x && Object.getOwnPropertyNames(x).length);
         }
         message = JSON.stringify(message);
       }
 
       try {
-        socket.send(message);
+        if ( socket ) {
+          socket.send(message);
+        }
       } catch(e) {
+        // client has disconnected
         DEBUG.val && console.warn(`${socket} error with sending message`, e, message);
-        console.warn(`${socket} error with sending message`, e, message);
         if ( ! socket && websockets.size === 0 && zl.act.zombieIsDead(zombie_port) ) {
           console.log(`Zombie Chrome is dead and there are no clients. Shutting down.`);
           try {
@@ -1133,6 +1494,76 @@
     return `${serverOrigin}/assets`;
   }
 
+  function ensureManifestDepth(manifestPath) {
+    const parts = manifestPath.split(path.sep);
+    const file = path.basename(manifestPath);
+    if ( file != 'manifest.json' ) throw new Error(`manifest.json does not end path`);
+    let distance = 0;
+    while(parts.length) {
+      const part = parts.pop();
+      if ( part == 'manifest.json' ) {
+        if ( distance != 0 ) throw new Error(`manifest.json exists mid path`);
+        continue;
+      } else {
+        distance++;
+      }
+      if ( part.length == 32 && part.match(/^[a-z]+$/) ) {
+        if ( distance > 2 ) {
+          throw new Error(`manifest.json is nested too deeply in extension direcotry`);
+        } else {
+          return part;
+        }
+      }
+    }
+  }
+
+  function localizeExtensionManifest({extensionSettings, extensionPath, manifest}) {
+    const keysToLocalize = ['short_name', 'name', 'description'];
+    const localesDir = path.resolve(extensionPath, '_locales');
+    if ( !fs.existsSync(localesDir) ) return manifest;
+    let localeMessages;
+    try {
+      const localeMessagesJSON = 
+          manifest.default_locale && 
+            fs.existsSync(path.resolve(localesDir, manifest.default_locale, 'messages.json')) ? 
+            fs.readFileSync(path.resolve(localesDir, manifest.default_locale, 'messages.json')).toString()
+            :
+          extensionSettings.manifest.current_locale && 
+            fs.existsSync(path.resolve(localesDir, extensionSettings.manifest.current_locale, 'messages.json')) ? 
+            fs.readFileSync(path.resolve(localesDir, extensionSettings.manifest.current_locale, 'messages.json')).toString()
+            :
+          extensionSettings.manifest.default_locale && 
+            fs.existsSync(path.resolve(localesDir, extensionSettings.manifest.default_locale, 'messages.json')) ? 
+              fs.readFileSync(path.resolve(localesDir, extensionSettings.manifest.default_locale, 'messages.json')).toString()
+            :
+            ''
+      if ( ! localeMessagesJSON || localeMessagesJSON.trim().length == 0 ) {
+        console.warn(`Error localizing extension`, {extensionSettings, extensionPath, manifest, localeMessagesJSON});
+        return manifest;
+      }
+      localeMessages = JSON.parse(localeMessagesJSON);
+    } catch(e) {
+        console.warn(`Error localizing extension`, {extensionSettings, extensionPath, manifest}, e);
+    }
+    if ( ! localeMessages ) return manifest;
+
+    for( const key of keysToLocalize ) {
+      let value, messageKey, localizedMessage;
+      try {
+        value = manifest[key];
+        if ( value?.startsWith?.("__MSG_") ) {
+          messageKey = value.replace(/^__MSG_/, '').replace(/__$/, '')
+          localizedMessage = (localeMessages[messageKey] || localeMessages[messageKey.toLocaleLowerCase()]).message;
+          manifest[key] = localizedMessage;
+        }
+      } catch(e) {
+        console.warn(`Error localizing key: ${key}`, e, {value, messageKey, localizedMessage, extensionSettings, extensionPath, manifest}); 
+      }
+    }
+
+    return manifest;
+  }
+
   function nextFileName(ext = '') {
     //console.log({nextFileName:{ext}});
     if ( ! ext.startsWith('.') ) {
@@ -1141,5 +1572,91 @@
     const name = `file${(Math.random()*1000000).toString(36)}${ext}`;
     //console.log({nextFileName:{name}});
     return name;
+  }
+
+  function startShutdownTimer() {
+    if ( shutdownTimer ) return;
+    console.log(`Starting BrowserBox shutdown timer on all clients disconnected`);
+    shutdownTimer = setTimeout(executeShutdownOfBBPRO, SHUTDOWN_MINUTES);
+  }
+
+  function stopShutdownTimer() {
+    clearTimeout(shutdownTimer);
+    console.log(`Stopped BrowserBox shutdown timer on a client connected`);
+    shutdownTimer = null;
+  }
+
+  function executeShutdownOfBBPRO() {
+    console.warn(`Stopping BrowserBox`);
+    return child_process.exec(`stop_bbpro`);
+  }
+
+  function populateExtensions() {
+    extensions.length = 0;
+    if ( CONFIG.isCT && DEBUG.extensionsAccess ) {
+      try {
+        const preferencesPath = path.resolve(BASE_PATH, 'browser-cache', 'Default', 'Preferences');
+        const preferences = JSON.parse(fs.readFileSync(preferencesPath).toString());
+        const extensionsManifests = child_process.execSync(`find "${EXTENSIONS_PATH}" | grep manifest.json`).toString();
+        extensionsManifests.split('\n').forEach(manifestPath => {
+          if ( manifestPath.trim().length == 0 ) return;
+          try {
+            manifestPath = path.resolve(manifestPath);
+            const extensionId = ensureManifestDepth(manifestPath);
+            const manifestJSON = fs.readFileSync(manifestPath).toString();
+            const manifest = JSON.parse(manifestJSON);
+            if ( ! manifest.name || ! manifest.version || ! manifest.manifest_version ) {
+              console.warn({manifest});
+              throw new Error(`Incorrect manifest. Will ignore: ${manifestPath}`)
+            }
+            const extensionPath = path.dirname(manifestPath);
+            const extensionSettings = preferences.extensions.settings[extensionId];
+            const localizedManifest = localizeExtensionManifest({extensionSettings, extensionPath, manifest});
+            if ( localizedManifest.display_in_launcher !== false ) {
+              if ( extensionSettings.state === 0 ) {
+                extensions.push({id: extensionId, enabled: false, ...localizedManifest});
+              } else {
+                extensions.push({id: extensionId, enabled: true, ...localizedManifest});
+              }
+            }
+          } catch(e) {
+            console.warn(`Error handling supposed extension path ${manifestPath}, via: ${EXTENSIONS_PATH}`, e);
+          }
+        });
+      } catch(e) {
+        console.warn(`Could not get manifests for extensions at: ${EXTENSIONS_PATH}`, e);
+      }
+    }
+    DEBUG.showExtensions && console.log({extensions});
+  }
+
+  /**
+   * Wrapper to run curl commands in Node.js
+   * @param {string} command - The curl command to execute.
+   * @param {boolean} isAsync - Whether to run the command asynchronously. Default is true.
+   * @returns {Promise<string> | string} - Resolves with the output if async, or returns the output if sync.
+   */
+  function runCurl(command, isAsync = true) {
+    if (!command.startsWith('curl')) {
+      throw new Error('Command must start with "curl".');
+    }
+
+    if (isAsync) {
+      return new Promise((resolve, reject) => {
+        exec(command, (error, stdout, stderr) => {
+          if (error) {
+            reject(`Error: ${stderr || error.message}`);
+            return;
+          }
+          resolve(stdout);
+        });
+      });
+    } else {
+      try {
+        return execSync(command, { encoding: 'utf-8' });
+      } catch (error) {
+        throw new Error(`Error: ${error.stderr || error.message}`);
+      }
+    }
   }
 

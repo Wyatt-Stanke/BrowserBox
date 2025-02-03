@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # killing bundling for now until work out babel issue
 # "Cannot find preset babel/env relative to directory public"
@@ -28,7 +28,7 @@ cd ../
 
 cd pptr-console-server
 rm -rf node_modules && rm package-lock.json && npm upgrade && npm audit fix
-cd websocket_chat_app_homework
+cd websocket_chat_app
 rm -rf node_modules && rm package-lock.json && npm upgrade && npm audit fix
 
 cd ../../

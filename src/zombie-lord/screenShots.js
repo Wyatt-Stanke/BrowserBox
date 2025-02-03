@@ -1,7 +1,14 @@
 //import {CWebp} from 'cwebp';
-import {DEBUG, sleep, CONFIG} from '../common.js';
+import {DEBUG, sleep, CONFIG, scratchState} from '../common.js';
 
-export const JPEG_QUAL = 80;
+const slowOrTORConnection = () => {
+  return process.env.TORBB || scratchState.connectFromTOR || scratchState.slowConnection;
+};
+const FORMAT = "jpeg"; // "png"
+const MIN_JPG_QUAL = () => slowOrTORConnection() ? 25 : 5;
+const MAX_JPG_QUAL = () => slowOrTORConnection() ? 75 : 80;
+const MAX_NTH_FRAME = () => slowOrTORConnection() ? 17 : 8;
+export const JPEG_QUAL = () => MAX_JPG_QUAL();
 export const MAX_ACK_BUFFER = 3;
 export const COMMON_FORMAT = Object.freeze({
   width: 1920,
@@ -15,8 +22,8 @@ export const DEVICE_FEATURES = {
   mobile: COMMON_FORMAT.mobile,
 };
 export const SCREEN_OPTS = {
-  format: 'jpeg',
-  quality: JPEG_QUAL,
+  format: FORMAT,
+  quality: JPEG_QUAL(),
   maxWidth: COMMON_FORMAT.width,
   maxHeight: COMMON_FORMAT.height,
   everyNthFrame: COMMON_FORMAT.everyNth,
@@ -31,20 +38,18 @@ const getScreenshotViewport = () => ({
 export const MIN_WIDTH = 300;
 export const MIN_HEIGHT = 300;
 export const WEBP_QUAL = 32;
-export const JPEG_WEBP_QUAL = 80;
+export const JPEG_WEBP_QUAL = MAX_JPG_QUAL();
 // these can be tuned UP on better bandwidth and DOWN on lower bandwidth
 export const ACK_COUNT = process.platform == 'darwin' ? 1 : 2; // how many frames per ack? this should be adapted per link capacity
-export const MAX_FRAMES = 2; /* 1, 2, 4 */
-const MIN_JPG_QUAL = 21;
-const MAX_JPG_QUAL = 80;
-const MAX_NTH_FRAME = 5;
-export const MIN_TIME_BETWEEN_SHOTS = 40; /* 20, 40, 100, 250, 500 */
-export const MIN_TIME_BETWEEN_TAIL_SHOTS = 175;
+export const MAX_FRAMES = () => slowOrTORConnection() ? 1 : 2; /* 1, 2, 4 */
+export const MIN_TIME_BETWEEN_SHOTS = () => slowOrTORConnection() ? 100 : 40; /* 20, 40, 100, 250, 500 */
+export const MIN_TIME_BETWEEN_TAIL_SHOTS = () => slowOrTORConnection() ? 1000 : 175;
 export const MAX_TIME_BETWEEN_TAIL_SHOTS = 4000;
 export const MAX_TIME_TO_WAIT_FOR_SCREENSHOT = 100;
-export const MAX_ROUNDTRIP = 1000;
-export const MIN_ROUNDTRIP = 125;
-export const MIN_SPOT_ROUNDTRIP = 125;
+// local testing values so small haha
+export const MAX_ROUNDTRIP = () =>  DEBUG.localTestRTT ? 100 : slowOrTORConnection() ? 4000 : 725;
+export const MIN_ROUNDTRIP = () => DEBUG.localTestRTT ? 80 : slowOrTORConnection() ? 2000 : 600;
+export const MIN_SPOT_ROUNDTRIP = () => slowOrTORConnection() ? 600 : 125;
 export const BUF_SEND_TIMEOUT = 50;
 const NOIMAGE = {img: '', frame:0};
 const KEYS = [
@@ -54,10 +59,10 @@ export const RACE_SAMPLE = 0.74;
 
 // image formats for capture depend on what the client can accept
   const WEBP_FORMAT = {
-    format: "png"
+    format: FORMAT,
   };
   const SAFARI_FORMAT = {
-    format: "jpeg",
+    format: FORMAT,
     quality: JPEG_QUAL 
   };
   const SAFARI_SHOT = {
@@ -75,6 +80,7 @@ export const RACE_SAMPLE = 0.74;
   };
 
 export function makeCamera(connection) {
+  let restartingNow = false;
   let shooting = false;
   let lastScreenOpts = null;
   let frameId = 1;
@@ -107,8 +113,43 @@ export function makeCamera(connection) {
     doShot, 
     shrinkImagery, 
     growImagery, 
-    restartCast
+    restartCast,
+    stopCast,
+    startCast,
   };
+
+  async function stopCast() {
+    DEBUG.logRestartCast && console.log(`Stopping cast`);
+    await connection.sessionSend({
+      name: "Page.stopScreencast",
+      params: {}
+    });
+  }
+
+  async function startCast() {
+    DEBUG.logRestartCast && console.log(`Starting cast`);
+    const {
+      format,
+      quality, everyNthFrame,
+      maxWidth, maxHeight
+    } = SCREEN_OPTS;
+    DEBUG.debugScreenSize && console.log(`Sending cast `, SCREEN_OPTS);
+    await connection.sessionSend({
+      name: "Page.startScreencast",
+      params: {
+        format, quality, everyNthFrame, 
+        ...(DEBUG.noCastMaxDims ? 
+          {}
+          : 
+          {maxWidth, maxHeight}
+        ),
+      }
+    });
+    lastScreenOpts = {
+      quality, everyNthFrame,
+      maxWidth, maxHeight,
+    };
+  }
 
   async function restartCast() {
     let restart = true;
@@ -123,82 +164,94 @@ export function makeCamera(connection) {
         restart = true;
       }
     }
-    if ( restart ) {
-      DEBUG.logRestartCast && console.log(`Restarting cast`);
-      await connection.sessionSend({
-        name: "Page.stopScreencast",
-        params: {}
-      });
-      await connection.sessionSend({
-        name: "Page.startScreencast",
-        params: SCREEN_OPTS
-      });
-      const {
-        quality, everyNthFrame,
-        maxWidth, maxHeight
-      } = SCREEN_OPTS;
-      lastScreenOpts = {
-        quality, everyNthFrame,
-        maxWidth, maxHeight,
-      };
-    } else {
-      DEBUG.logRestartCast && console.log(`Restart requested by nothing changed so not restarting cast.`);
+    if ( CONFIG.alwaysRestartCast ) {
+      restart = true;
+      DEBUG.logRestartCast && console.log(`ALWAYS restarting cast.`);
     }
+    try {
+      if ( restart ) {
+        if ( restartingNow ) return;
+        restartingNow = true;
+        DEBUG.logRestartCast && console.log(`Restarting cast`);
+        await connection.sessionSend({
+          name: "Page.stopScreencast",
+          params: {}
+        });
+        const {
+          format,
+          quality, everyNthFrame,
+          maxWidth, maxHeight
+        } = SCREEN_OPTS;
+        await connection.sessionSend({
+          name: "Page.startScreencast",
+          params: {
+            format, quality, everyNthFrame, 
+            ...(DEBUG.noCastMaxDims ? 
+              {}
+              : 
+              {maxWidth, maxHeight}
+            ),
+          }
+        });
+        lastScreenOpts = {
+          quality, everyNthFrame,
+          maxWidth, maxHeight,
+        };
+      } else {
+        DEBUG.logRestartCast && console.log(`Restart requested by nothing changed so not restarting cast.`);
+      }
+    }catch(e) {
+      console.warn(`Error restarting cast`, e);
+    }
+    restartingNow = false;
   }
 
   async function shrinkImagery() {
+    if ( SCREEN_OPTS.everyNthFrame >= MAX_NTH_FRAME() && SCREEN_OPTS.quality <= MIN_JPG_QUAL() ) {
+      // we don't go any lower
+      return;
+    }
     SAFARI_SHOT.command.params.quality -= 20;
     SCREEN_OPTS.quality -= 20;
-    if ( SAFARI_SHOT.command.params.quality < MIN_JPG_QUAL ) {
-      SAFARI_SHOT.command.params.quality = MIN_JPG_QUAL;
+    if ( SAFARI_SHOT.command.params.quality < MIN_JPG_QUAL() ) {
+      SAFARI_SHOT.command.params.quality = MIN_JPG_QUAL();
     }
-    if ( SCREEN_OPTS.quality < MIN_JPG_QUAL ) {
-      SCREEN_OPTS.quality = MIN_JPG_QUAL;
-      SCREEN_OPTS.everyNthFrame += 1;
-      if ( SCREEN_OPTS.everyNthFrame > MAX_NTH_FRAME ) {
-        SCREEN_OPTS.everyNthFrame = MAX_NTH_FRAME;
-        return;
+    if ( SCREEN_OPTS.quality < MIN_JPG_QUAL() ) {
+      SCREEN_OPTS.quality = MIN_JPG_QUAL();
+      SCREEN_OPTS.everyNthFrame += 2;
+      if ( SCREEN_OPTS.everyNthFrame > MAX_NTH_FRAME() ) {
+        SCREEN_OPTS.everyNthFrame = MAX_NTH_FRAME();
       }
       DEBUG.debugAdaptiveImagery && console.log(`Will only send every ${SCREEN_OPTS.everyNthFrame}th frame`);
     }
     if ( DEBUG.debugAdaptiveImagery ) {
       console.log(`Shrinking JPEG quality to ${SAFARI_SHOT.command.params.quality}`);
     }
-    await connection.sessionSend({
-      name: "Page.stopScreencast",
-      params: {}
-    });
-    await connection.sessionSend({
-      name: "Page.startScreencast",
-      params: SCREEN_OPTS
-    });
+    restartCast();
   }
 
   async function growImagery() {
+    if ( SCREEN_OPTS.quality >= MAX_JPG_QUAL() ) {
+      // we don't go any higher
+      return;
+    }
+
     SAFARI_SHOT.command.params.quality = 80;
     SCREEN_OPTS.quality = 80;
-    if ( SAFARI_SHOT.command.params.quality > MAX_JPG_QUAL ) {
-      SAFARI_SHOT.command.params.quality = MAX_JPG_QUAL;
+    if ( SAFARI_SHOT.command.params.quality > MAX_JPG_QUAL() ) {
+      SAFARI_SHOT.command.params.quality = MAX_JPG_QUAL();
     }
     if ( SCREEN_OPTS.everyNthFrame != 1 ) {
       SCREEN_OPTS.everyNthFrame = 1;
       DEBUG.debugAdaptiveImagery && console.log(`Will now send every ${SCREEN_OPTS.everyNthFrame}th frame`);
     }
-    if ( SCREEN_OPTS.quality > MAX_JPG_QUAL ) {
-      SCREEN_OPTS.quality = MAX_JPG_QUAL;
-      return;
+    if ( SCREEN_OPTS.quality > MAX_JPG_QUAL() ) {
+      SCREEN_OPTS.quality = MAX_JPG_QUAL();
     }
     if ( DEBUG.debugAdaptiveImagery ) {
       console.log(`Growing JPEG quality to ${SAFARI_SHOT.command.params.quality}`);
     }
-    await connection.sessionSend({
-      name: "Page.stopScreencast",
-      params: {}
-    });
-    await connection.sessionSend({
-      name: "Page.startScreencast",
-      params: SCREEN_OPTS
-    });
+    restartCast();
   }
 
   function queueTailShot() {
@@ -218,7 +271,7 @@ export function makeCamera(connection) {
     if ( DEBUG.noShot ) return NOIMAGE;
     const timeNow = Date.now();
     const dur = timeNow - lastShot;
-    if ( !opts.ignoreHash && dur < MIN_TIME_BETWEEN_SHOTS ) {
+    if ( !opts.ignoreHash && dur < MIN_TIME_BETWEEN_SHOTS() ) {
       if ( DEBUG.shotDebug && DEBUG.val > DEBUG.low ) {
         console.log(`Dropping as duration (${dur}) too short.`);
       }
@@ -231,6 +284,9 @@ export function makeCamera(connection) {
     let response;
     //const ShotCommand = ((connection.isSafari || connection.isFirefox) ? SAFARI_SHOT : WEBP_SHOT).command;
     const ShotCommand = SAFARI_SHOT.command;
+    if ( opts.blockExempt ) {
+      ShotCommand.blockExempt = true;
+    }
     DEBUG.shotDebug && console.log(`XCHK screenShot.js (${ShotCommand.name}) call response`, ShotCommand, response ? JSON.stringify(response).slice(0,140) : response );
     response = await Promise.race([
       connection.sessionSend(ShotCommand),
@@ -348,18 +404,19 @@ export function makeCamera(connection) {
         connection.frameBuffer.push(F);
       }
 
-      while ( connection.frameBuffer.length > MAX_FRAMES ) {
+      const mf = MAX_FRAMES();
+      while ( connection.frameBuffer.length > mf ) {
         connection.frameBuffer.shift();
       }
     }
 
-    queueTailShot();
+    if ( CONFIG.tailShots ) queueTailShot();
 
     DEBUG.shotDebug && console.log({framesWaiting:connection.frameBuffer.length, now: Date.now()});
   }
 
   async function doShot(opts = {}) {
-    if ( !(opts.ignoreHash || opts.forceFrame) && (nextShot || shooting) ) {
+    if ( !(opts.ignoreHash || opts.forceFrame || opts.blockExempt) && (nextShot || shooting) ) {
       DEBUG.shotDebug && DEBUG.val > DEBUG.low && console.log(`Dropping shot`, opts.ignoreHash, opts.forceFrame, nextShot, shooting);
       return;
     }
@@ -368,7 +425,7 @@ export function makeCamera(connection) {
       saveShot(opts),
       sleep(MAX_TIME_TO_WAIT_FOR_SCREENSHOT)
     ]);
-    nextShot = setTimeout(() => nextShot = false, MIN_TIME_BETWEEN_SHOTS);
+    nextShot = setTimeout(() => nextShot = false, MIN_TIME_BETWEEN_SHOTS());
     shooting = false;
   }
 }

@@ -2,11 +2,10 @@
   // imports
     import {handleSelectMessage} from './handlers/selectInput.js';
     import {fetchTabs} from './handlers/targetInfo.js';
-    //import {demoZombie, fetchDemoTabs}  from './handlers/demo.js';
+    import {detectIMEInput} from './ime_detection.js';
     import {handleMultiplayerMessage} from './handlers/multiplayer.js';
     import {handleKeysCanInputMessage} from './handlers/keysCanInput.js';
     import {handleElementInfo} from './handlers/elementInfo.js';
-    // MIGRATE
     import {CTX_MENU_THRESHOLD, makeContextMenuBondTasks} from './subviews/contextMenu.js';
     import {handleScrollNotification} from './handlers/scrollNotify.js';
     import {resetLoadingIndicator,showLoadingIndicator} from './handlers/loadingIndicator.js';
@@ -14,13 +13,19 @@
     import DEFAULT_FAVICON from './subviews/faviconDataURL.js';
     import EventQueue from './eventQueue.js';
     import {default as transformEvent, getKeyId, controlChars} from './transformEvent.js';
-    // MIGRATE
     import {saveClick} from './subviews/controls.js';
     import {
+      throwAfter,
+      AttachmentTypes,
+      HIDDEN_DOMAINS,
+      COMMON,
       untilTrue,
+      untilHuman,
+      untilTrueOrTimeout,
       logit, sleep, debounce, DEBUG, BLANK, 
       CONFIG,
       OPTIONS,
+      FACADE_HOST_REGEX,
       isFirefox, isSafari, deviceIsMobile,
       SERVICE_COUNT,
       // for bang
@@ -29,6 +34,7 @@
       logitKeyInputEvent,
     } from './common.js';
     import {component, subviews, saveCanvas, audio_login_url} from './view.js';
+    import InternetChecker from './connectivity.js';
 
     //import installDemoPlugin from '../../plugins/demo/installPlugin.js';
     //import installAppminifierPlugin from '../../plugins/appminifier/installPlugin.js';
@@ -38,17 +44,25 @@
     import {s as R, c as X} from '../node_modules/bang.html/src/vv/vanillaview.js';
 
   // constants
+    const Connectivity = {
+      checker: new InternetChecker(CONFIG.netCheckTimeout, DEBUG.netCheckDebug),
+    };
+
+    Connectivity.checker.checkInternet();
+
     const ThrottledEvents = new Set([
       "mousemove", "pointermove", "touchmove"
     ]);
 
     const CancelWhenSyncValue = new Set([
+      /*
       "keydown",
       "keyup",
       "keypress",
       "compositionstart",
       "compositionend",
       "compositionupdate",
+      */
     ]);
 
     const EnsureCancelWhenSyncValue = e => {
@@ -97,6 +111,7 @@
     const IMMEDIATE = 0;
     const SHORT_DELAY = 20;
     const LONG_DELAY = 300;
+    const NEW_TAB_ACTIVATE_DELAY = 400;
     const VERY_LONG_DELAY = 60000;
     const EVENT_THROTTLE_MS = 60;  /* 20, 40, 80 */
 
@@ -112,6 +127,10 @@
       // security
         const sessionToken = globalThis._sessionToken();
         location.hash = '';
+        const useCookies = !CONFIG.isOnion && (await document?.hasStorageAccess?.()) && ! CONFIG.openServicesInCloudTabs;
+
+      // state
+        let _isConnected = true;
 
       // constants
         const closed = new Set();
@@ -121,26 +140,87 @@
         const state = {
           mySource: (Math.random()*1e10).toString(36)
         };
+        await untilTrueOrTimeout(() => globalThis?.localStorage?.getItem?.('sessionToken'), 120); // wait 2 minutes
+        await untilTrueOrTimeout(() => globalThis?.localStorage?.getItem?.('localCookie'), 120); // wait 2 minutes
         const {tabs,vmPaused,activeTarget,requestId} = await (/*demoMode ? fetchDemoTabs() : */ fetchTabs({sessionToken}, () => state));
         // when app loads get favicons for any existing tabs 
         tabs.forEach(({targetId}) => {
           //initialGetFavicon(targetId);
           //getFavicon(targetId);
         });
+        const updateTabs = debounce(rawUpdateTabs, LONG_DELAY);
+
         // MIGRATE (go)
         const {
           go,
           limitCursor,
         } = subviews;
 
+      // account
+        const isSubscriber = {};
+
+        try {
+          fetch(`/isSubscriber?sessionToken=${sessionToken}`).then(r => r.json()).then(resp => {
+            // gotta make money
+            Object.assign(isSubscriber, resp || {});
+          }).catch(e => console.warn(`Could not determine if user is a subscriber`, e));
+        } catch(e) {
+          console.warn(`Could not check is user is subscriber`, e);
+        }
+
+        // UTC epoch seconds when the browser expires
+        const browserExpiresAt = {};
+
+        try {
+          fetch(`/expiry_time?sessionToken=${sessionToken}`).then(r => r.json()).then(resp => {
+            // gotta make money
+            const time = Number(resp?.expiry_time);
+            if ( Number.isNaN(time) ) {
+              throw new Error(`Cannot read browser expiry time. Browser will shut down at scheduled expiry time but expiry countdown clock may not display correctly`);
+            }
+            browserExpiresAt.browserExpiresAt = time;
+            console.info(`Browser will expire at UTC: ${new Date(browserExpiresAt.browserExpiresAt*1000)}`);
+          }).catch(e => console.warn(`Could not determine expiry time for countdown clock. Clock will assume 5 minutes.`, e));
+        } catch(e) {
+          console.info(`Error accessing browser expiry clock time. This does not affect any scheduled shutdown. For unlimited sessions, subscribe now. Or extend your session by 1 hour by purchasing at the button above`, e);
+        } 
+
       // url params
         const urlParams = new URLSearchParams(location.search);
         const urlFlags = parseURLFlags(urlParams);
 
+      // save local cookie
+        let lcResolve, lcReject;
+        const localCookiePromise = new Promise((res, rej) => (lcResolve = res, lcReject = rej));
+        untilTrueOrTimeout(() => localStorage.getItem('localCookie'), 420)
+          .then(() => lcResolve(localStorage.getItem('localCookie')))
+          .catch(err => lcReject(err));
+
       // app state
-        Object.assign(state, {
+        magicAssign(state, {
+          // account (CloudTabs, etc),
+          isSubscriber, 
+          browserExpiresAt,
+
+          // setup
+          untilLoaded,
+
+          // internet
+          Connectivity,
+
+          // main comms
           H,
           checkResults,
+          useCookies,
+
+          // instrumentation
+          execute,
+
+          // set up progress
+          safariLongTapInstalled: false,
+
+          // force a re display
+          refreshViews,
 
           // chrome browser UI (tabs, address bar, etc)
           chromeUI: (
@@ -152,11 +232,15 @@
             )
           ),
 
-          // UI
+          // Client IME UI
           hideIMEUI,
           showIMEUI,
 
+          // IME input detection
+          detectIMEInput,
+
           // bandwidth
+          showBandwidthIssue: false,
           messageDelay: 0,          // time it takes to receive an average, non-frame message
           showBandwidthRate: true,
           myBandwidth: 0,
@@ -166,6 +250,15 @@
           totalBytesThisSecond: 0,
           totalBandwidth: 0,
           frameBandwidth: [],
+          get connected() {
+            return _isConnected;
+          },
+          set connected(val) {
+            _isConnected = val;
+            if ( ! val ) {
+              COMMON.delayUnload = false;
+            }
+          },
 
           // demo mode
           demoMode,
@@ -181,8 +274,15 @@
           // for firefox because it's IME does not fire inputType
           // so we have no simple way to handle deleting content backward
           // this should be FF on MOBILE only probably so that's why it's false
-          convertTypingEventsToSyncValueEvents: deviceIsMobile(),
-          //convertTypingEventsToSyncValueEvents: false,
+          isMobile: deviceIsMobile(),
+
+          get currentInputLanguageUsesIME() {
+            //console.log('requested ime use', this, (new Error).stack);
+            return state.usingIME;
+          },
+          get convertTypingEventsToSyncValueEvents() {
+            return state.isMobile || state.currentInputLanguageUsesIME;
+          },
 
           // for safari to detect if pointerevents work
           DoesNotSupportPointerEvents: true,
@@ -211,6 +311,9 @@
           createTab,
           activeTab,
           favicons: new Map(),
+          rawUpdateTabs,
+          updateTabs,
+          emulateActive,
 
           // timing constants
           IMMEDIATE,
@@ -230,7 +333,9 @@
             }
           },
 
+          getViewport,
           clearViewport,
+          doShot,
 
           addListener(name, func) {
             let funcList = listeners.get(name); 
@@ -245,6 +350,9 @@
 
           sidebarMenuActive: false,
           sessionToken,
+          get localCookie() {
+            return localCookiePromise;
+          },
 
           // services
           loggedInCount: 0,
@@ -279,6 +387,7 @@
           contextMenuEvent: null,
           contextMenuBondTasks: makeContextMenuBondTasks(state),
           untilTrue,
+          untilTrueOrTimeout,
 
           // MIGRATE (go)
           go,
@@ -286,7 +395,8 @@
           logitKeyInputEvent,
           runUpdateTabs,
 
-          // for Magic bar
+          // for Magic bar 
+          // and also for Tor
           CONFIG,
 
           // for offline
@@ -299,21 +409,49 @@
           },
 
           clearBrowser() {
-            this.tabs = [];
-            this.attached = new Set();
-            this.activeTarget = null;
-            this.lastTarget = null;
-            this.favicons = new Map();
-            this.tabMap = new Map();
-            this.closed = new Set();
-            this.latestRequestId = 0;
+            state.tabs = [];
+            state.attached = new Set();
+            state.activeTarget = null;
+            state.lastTarget = null;
+            state.favicons = new Map();
+            state.tabMap = new Map();
+            state.closed = new Set();
+            state.latestRequestId = 0;
           },
 
-          latestRequestId: 0
+          latestRequestId: 0,
 
+          // for extensions
+          getExtensions
         });
 
+      // plugins
+        const plugins = {};
+        if ( DEBUG.detectPuterAbility ) {
+          DEBUG.logPlugins && console.log(`Loading puter ability plugin...`);
+          try {
+            const module = await import('./plugins/puterAbility.js');
+            const {default:untilPuterAbility, setFileContext, handlePuterAbility} = module;
+            untilPuterAbility().then(() => {
+              DEBUG.logPlugins && console.log(`Puter ability`, globalThis.hasPuterAbility);
+              if ( globalThis.hasPuterAbility ) {
+                state.hasPuterAbility = globalThis.hasPuterAbility;
+              }
+            });
+            if ( handlePuterAbility && setFileContext ) {
+              plugins.handlePuterAbility = handlePuterAbility;
+              plugins.setFileContext = setFileContext;
+            } else {
+              throw new TypeError(`Puter ability handlers 'handlePuterAbility' or 'setFileContext' not exported from a plugin module`);
+            }
+            DEBUG.logPlugins && console.log(`Plugin to detect puter ability loaded and ready.`);
+          } catch(e) {
+            console.warn(`detectPuterAbility is on but we could not load a plugin module for it.`, e);
+          }
+        }
+
       // variables
+        let Root = document;
         let lastTime = new Date;
         let modaler;
         state.latestRequestId = requestId;
@@ -321,8 +459,6 @@
       DEBUG.exposeState && (self.state = state);
 
       patchGlobals();
-
-      const updateTabs = debounce(rawUpdateTabs, LONG_DELAY);
 
       /*
       if ( state.demoMode ) {
@@ -334,9 +470,27 @@
         Object.assign(self, {state});
       }
 
+      if ( DEBUG.debugTyping ) {
+        self.addEventListener('focusin', logTyping, {capture:true});
+        self.addEventListener('compositionstart', logTyping, {capture:true});
+        self.addEventListener('keydown', logTyping, {capture:true});
+        self.addEventListener('keyup', logTyping, {capture:true});
+        self.addEventListener('beforeinput', logTyping, {capture:true});
+        self.addEventListener('input', logTyping, {capture:true});
+        self.addEventListener('compositionupdate', logTyping, {capture:true});
+        self.addEventListener('compositionend', logTyping, {capture:true});
+        self.addEventListener('focusout', logTyping, {capture:true});
+      }
+
       const {searchParams} = new URL(location);
+
+      if ( (searchParams.has('cloudTabsStatusLine') || location.hostname.endsWith('.cloudtabs.net')) && ! searchParams.has('forceRegularStatusLine') ) {
+        state.cloudTabsStatusLine = true; 
+        setState('bbpro', state);
+      }
+
       if ( searchParams.has('url') ) {
-        const urls = [];
+        let urls = [];
         try {
           const data = JSON.parse(searchParams.get('url'));
           let isList = Array.isArray(data);
@@ -345,6 +499,19 @@
           } else {
             urls.push(data);
           }
+          urls = urls.map(url => {
+            try {
+              url = new URL(url.replace(/ /g, '+'));
+              if ( url.protocol == 'web+bb:' ) {
+                //url = url.href.slice(9);
+                url = `${url.pathname.replace(/\/\//, '')}${url.search}${url.hash}`;
+              }
+              return url+'';
+            } catch(e) {
+              console.warn(e, url);
+              return new Error(`not a URL`);
+            }
+          }).filter(thing => !(thing instanceof Error));
         } catch(e) {
           alert(`Issue with starting URL: ${e}`);
           console.warn(e);
@@ -360,11 +527,78 @@
         });
       }
 
-      const queue = new EventQueue(state, sessionToken);
-      DEBUG.val && console.log({queue});
-      if ( DEBUG.fullScope ) {
-        globalThis.queue = queue;
-      }
+      // check tor status
+        {
+          const isTorAPI = new URL(location.origin);
+          isTorAPI.pathname = '/isTor';
+          uberFetch(isTorAPI).then(r => r.json()).then(({isTor}) => {
+            state.isTor = isTor;
+            if ( state.isTor ) {
+              setState('bbpro', state);
+            }
+          });
+        }
+
+      // check extensions status
+          const extensionsAPI = new URL(location.origin);
+          extensionsAPI.pathname = '/extensions';
+
+          getExtensions();
+
+          // function to dynamically get extensions
+            async function getExtensions() {
+              const extensionsAPI = new URL(location.origin);
+              extensionsAPI.pathname = '/extensions';
+              const cacheKey = 'extensionsCache';
+
+              return uberFetch(extensionsAPI)
+                .then(async (r) => {
+                  if (r.status === 429) {
+                    // If rate limit hit, use cached data if available
+                    const cachedData = localStorage.getItem(cacheKey);
+                    if (cachedData) {
+                      // Parse and return the cached data
+                      return JSON.parse(cachedData);
+                    } else {
+                      throw new Error('Rate limit hit and no cache available.');
+                    }
+                  }
+                  // If no rate limit issue, parse response and update cache
+                  const data = await r.json();
+                  localStorage.setItem(cacheKey, JSON.stringify(data));
+                  return data;
+                })
+                .then(({ extensions }) => {
+                  state.extensions = extensions;
+                  if (extensions.length) {
+                    setState('bbpro', state);
+                  }
+                  return extensions; // Optionally return extensions for further use
+                })
+                .catch((error) => {
+                  console.error('Failed to fetch extensions:', error);
+                  return null; // Optionally handle or return null on error
+                });
+            }
+
+      // create link
+        const queue = new EventQueue(state, sessionToken);
+        DEBUG.val && console.log({queue});
+        if ( DEBUG.fullScope ) {
+          globalThis.queue = queue;
+        } else {
+          //globalThis.queue = queue;
+        }
+
+      // make this so we can call it on resize
+        window._voodoo_asyncSizeTab = async (opts) => {
+          await sleep(40);
+          const viewport = await sizeTab(opts);
+          queue.sendViewport(viewport);
+          return viewport;
+        };
+
+      await sleep(5);
 
       // plugins 
         /**
@@ -394,9 +628,9 @@
       // event handlers
         // multiplayer connections
           const MENU = new URL(location);
-          MENU.port = parseInt(location.port) - 1;
+          MENU.port = parseInt(CONFIG.mainPort) - 1;
           const CHAT = new URL(location);
-          CHAT.port = parseInt(location.port) + 2;
+          CHAT.port = parseInt(CONFIG.mainPort) + 2;
           self.addEventListener('message', ({data, origin, source}) => {
             if ( origin === CHAT.origin ) {
               if ( data.multiplayer ) {
@@ -425,329 +659,494 @@
             DEBUG.val && console.log({sidebarMenuActive: state.sidebarMenuActive});
             subviews.UnreadBadge(state);
           });
+          queue.addMetaListener('resize', meta => {
+            DEBUG.debugResize && console.log(`Received resize event from remote browser (server)`, meta);
+            clearViewport();
+          });
           queue.addMetaListener('multiplayer', meta => handleMultiplayerMessage(meta, state));
+        
+        // download progress
+          queue.addMetaListener('downloPro', ({downloPro}) => {
+            DEBUG.debugDownloadProgress && console.log(JSON.stringify({downloPro}, null, 2));
+            const {receivedBytes, totalBytes, done, state: dlState} = downloPro;
+            if ( dlState == 'canceled' ) {
+              const {guid, receivedBytes} = downloPro;
+              console.warn(`Download ${guid} cancelled after ${receivedBytes} bytes received.`);
+            } 
+            state.topBarComponent.updateDownloadStatus(downloPro);
+          });
 
         // should go in bb-view script.js 
         // (so we can use el.shadowRoot instead of document)
         // as context for querySelector
         // audio login
-          self.addEventListener('message', ({data, origin, source}) => {
-            DEBUG.val && console.log('message for audio', {data,origin,source});
-            const AUDIO = new URL(location);
-            AUDIO.pathname = '/stream';
-            AUDIO.port = parseInt(location.port) - 2;
+        let settingUp = false;
+        async function setupAudio() {
+          if ( settingUp ) {
+            return false;
+          }
+          settingUp = true;
+          try {
+            const AUDIO = CONFIG.isOnion ? new URL(
+                `${location.protocol}//${localStorage.getItem(CONFIG.audioServiceFileName)}`
+              ) 
+              : 
+              new URL(location)
+            ;
+            AUDIO.pathname = DEBUG.useStraightAudioStream ? '/' : '/stream';
+            const DEFAULT_AUDIO_PORT = parseInt(CONFIG.mainPort) - 2;
+            AUDIO.port = (CONFIG.isOnion || CONFIG.isDNSFacade) ? 443 : DEFAULT_AUDIO_PORT;
+            if ( CONFIG.isDNSFacade ) {
+              const subs = location.hostname.split('.');
+              if ( subs?.[0]?.match?.(FACADE_HOST_REGEX)?.index == 0 ) {
+                subs.shift();
+                subs.unshift(`p${DEFAULT_AUDIO_PORT}`);
+              }
+              AUDIO.hostname = subs.join('.');
+            }
             AUDIO.searchParams.set('ran', Math.random());
-            if ( origin === AUDIO.origin ) {
-              if ( data.request ) {
-                if ( data.request.login ) {
-                  DEBUG.val && console.log('send session token', data, state.sessionToken);
-                  source.postMessage({login:{sessionToken:state.sessionToken}}, origin);
-                } else if ( data.request.audio ) {
-                  DEBUG.debugAudio && console.log('doing audio');
-                  state.loggedInCount += 1;
-                  if ( state.loggedInCount >= SERVICE_COUNT ) {
-                    console.log("Everybody logged in");
-                    state.sessionToken = null;
-                  }
-                  const frame = Root.querySelector('iframe#audio-login');
-                  frame?.remove();
-                  if ( DEBUG.useStraightAudioStream ) {
-                    const audio = Root.querySelector('video#audio');
-                    const source = document.createElement('source');
-                    //source.type = 'audio/mp3';
-                    //source.type = 'audio/flac';
-                    source.type = 'audio/wav';
-                    console.warn(`Need to replace this with a websocket and audiocontext from audio-streamer`);
-                    source.src = AUDIO;
-                    DEBUG.debugAudio && console.log({'audio?': audio});
-                    if ( audio ) {
-                      audio.append(source);
-                      audio.addEventListener('playing', () => audio.playing = true);
-                      audio.addEventListener('waiting', () => audio.playing = false);
-                      audio.addEventListener('ended', () => audio.playing = false);
-                      const activateAudio = async () => {
-                        DEBUG.debugAudio && console.log('called activate audio');
-                        if ( audio.muted || audio.hasAttribute('muted') ) {
-                          audio.muted = false;
-                          audio.removeAttribute('muted');
-                        }
-                        if ( !audio.playing ) {
-                          try {
-                            await audio.play();
-                            send("ack");
-                          } catch(err) {
-                            DEBUG.debugAudio && console.info(`Could not yet play audio`, err); 
-                            return;
-                          }
-                        }
-                        if ( CONFIG.removeAudioStartHandlersAfterFirstStart ) {
-                          Root.removeEventListener('pointerdown', activateAudio);
-                          Root.removeEventListener('touchend', activateAudio);
-                          DEBUG.debugAudio && console.log('Removed audio start handlers');
-                        }
-                      };
-                      setTimeout(activateAudio, 0);
-                      Root.addEventListener('pointerdown', activateAudio);
-                      Root.addEventListener('touchend', activateAudio);
-                      Root.addEventListener('click', activateAudio, {once:true});
-                      DEBUG.debugAudio && console.log('added handlers', Root, audio);
-                    } else {
-                      console.log(Root);
-                      console.warn(`Audio element 'audio#audio' not found.`);
-                    }
-                  } else {
-                    let activateAudio;
-                    let fetchedData;
-                    if ( DEBUG.includeAudioElementAnyway ) {
-                      const audio = Root.querySelector('audio#audio');
-                      const source = document.createElement('source');
-                      //source.type = 'audio/mp3';
-                      //source.type = 'audio/flac';
-                      source.type = 'audio/wav';
-                      source.src = '/silent_half-second.wav';
-                      if ( audio ) {
-                        audio.append(source);
-                        audio.addEventListener('playing', () => {
-                          DEBUG.debugAudio && console.log('audio playing ~~ for first time since page load, so clearing buffer');
-                          fetchedData = new Float32Array( 0 );
-                          audio.playing = true;
-                        });
-                        audio.addEventListener('waiting', () => audio.playing = false);
-                        audio.addEventListener('ended', () => audio.playing = false);
-                        activateAudio = async () => {
-                          DEBUG.debugAudio && console.log('called activate audio');
-                          audio.muted = false;
-                          audio.removeAttribute('muted');
-                          if ( true || !audio.playing ) {
-                            try {
-                              DEBUG.debugAudio && console.log(`Trying to play...`);
-                              await audio.play();
-                              send("ack");
-                            } catch(err) {
-                              DEBUG.debugAudio && console.info(`Could not yet play audio`, err);
-                              return;
-                            }
-                          }
-                          if ( CONFIG.removeAudioStartHandlersAfterFirstStart ) {
-                            Root.removeEventListener('pointerdown', activateAudio);
-                            Root.removeEventListener('touchend', activateAudio);
-                            DEBUG.debugAudio && console.log('Removed audio start handlers');
-                          }
-                        };
-                        setTimeout(activateAudio, 0);
-                        Root.addEventListener('pointerdown', activateAudio);
-                        Root.addEventListener('touchend', activateAudio);
-                        Root.addEventListener('click', activateAudio, {once:true});
-                        DEBUG.debugAudio && console.log('added handlers', Root, audio);
+
+            AUDIO.searchParams.set('localCookie', await state.localCookie);
+            if ( ! state.useCookies ) {
+              // due to 3rd-party cookie restrictions in for example
+              // modern browsers post 2024, incognitor or private browsing, or Tor browser 
+              // we take an easy approach for now to auth
+              // simply logging in to the audio stream using a token every time, avoiding any need for cookies
+              AUDIO.searchParams.set('token', localStorage.getItem(CONFIG.sessionTokenFileName));
+            }
+            if ( CONFIG.isOnion || globalThis.comingFromTOR || ! globalThis.AudioContext ) {
+              AUDIO.searchParams.set('token', globalThis._sessionToken());
+              setupAudioElement('audio/wav');
+            } else {
+              self.addEventListener('message', ({data, origin, source}) => {
+                DEBUG.val && console.log('message for audio', {data,origin,source});
+                if ( origin === AUDIO.origin ) {
+                  if ( data.request ) {
+                    if ( data.request.login ) {
+                      (DEBUG.debugAudio || DEBUG.val) && console.log('send session token', data, state.sessionToken);
+                      state.audioMessageReceived = true;
+                      source.postMessage({login:{sessionToken:state.sessionToken}}, origin);
+                    } else if ( data.request.audio ) {
+                      (DEBUG.val || DEBUG.debugAudio) && console.log('doing audio');
+                      state.audioMessageReceived = true;
+                      state.loggedInCount += 1;
+                      if ( state.loggedInCount >= SERVICE_COUNT ) {
+                        console.log("Everybody logged in");
+                        //state.sessionToken = null;
+                      }
+                      const frame = Root.querySelector('iframe#audio-login');
+                      frame?.remove();
+                      if ( DEBUG.useStraightAudioStream || globalThis.comingFromTOR || !globalThis.AudioContext ) {
+                        setupAudioElement('audio/wav');
                       } else {
-                        console.log(Root);
-                        console.warn(`Audio element 'audio#audio' not found.`);
-                      }
-                    }
-                    const audios = [];
-                    self.audios = audios;
-                    const wsUri = new URL(AUDIO);
-                    wsUri.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-                    wsUri.hash = '';
-                    let ws;
-                    const channels = 1;
-                    const min_sample_duration = 0.5; // seconds;
-                    const sample_rate = 44100; // Hz;
-                    const min_sample_size = min_sample_duration * sample_rate;
-                    let chunk_size = 2**14;
-                    let counter = 1;
-                    let playing = false;
-                    let active = false;
-                    let ctx;
-                    let gain;
-                    let activeNode;
-                    let is_reading = false;
-                    let audioReconnectMs = AUDIO_RECONNECT_MS;
-                    let stopped = true;
-                    fetchedData = new Float32Array( 0 );
-
-                    const ensureResume = () => {
-                      if ( ! ctx ) return;
-                      ctx && ctx.resume();
-                      document.removeEventListener('click', ensureResume);
-                    };
-
-                    document.addEventListener('click', ensureResume);
-
-                    document.addEventListener('click', beginSound, {once: true});
-                    beginSound();
-
-                    function beginSound() {
-                      stopped = false;
-                      active = true;
-                      ctx = new AudioContext({
-                        sampleRate: sample_rate
-                      });
-                      gain = ctx.createGain();
-                      gain.gain.value = 0.618;
-                      gain.connect( ctx.destination );
-
-                      connectAudio();
-                      readingLoop();
-                    }
-
-                    function connectAudio() {
-                      // 0 - CONNECTING, 1 - OPEN, 2 - CLOSING, 3 - CLOSED
-                      if ( ws?.readyState < 2 ) return;
-                      DEBUG.debugAudio && console.log(`Creating websocket...`);
-                      ws = new WebSocket(wsUri);
-                      DEBUG.debugAudio && console.log('Create ws');
-                      DEBUG.debugAudio && console.log(`Created`, ws);
-                      ws.binaryType = 'arraybuffer';
-
-                      ws.addEventListener('open', msg => {
-                        DEBUG.debugAudio && console.log('ws open');
-                        DEBUG.debugAudio && console.log(`Audio websocket connected`, msg);
-                        state.audioConnected = true;
-                        state.setTopState();
-                        audioReconnectMs = AUDIO_RECONNECT_MS;
-                        setTimeout(activateAudio, 0);
-                        readingLoop();
-                      });
-
-                      ws.addEventListener('close', msg => {
-                        DEBUG.debugAudio && console.log(`Audio websocket closing`, msg); 
-                        state.audioConnected = false;
-                        audioReconnectMs = AUDIO_RECONNECT_MS;
-                        setTimeout(audioReconnect, 0);
-                        state.setTopState();
-                      });
-
-                      ws.addEventListener('message', async msg => {
-                        DEBUG.debugAudioAcks && console.log('client got msg %s', msg.data.length || msg.data.byteLength);
-                        send("ack");
-                        if ( typeof msg.data === "string" ) {
-                          DEBUG.debugAudioAck && console.log('audio ws message', msg.data);
-                          return;
+                        let activateAudio;
+                        let fetchedData;
+                        if ( DEBUG.includeAudioElementAnyway ) {
+                          const audio = Root.querySelector('video#audio');
+                          const source = document.createElement('source');
+                          source.type = 'audio/wav';
+                          source.src = '/silent_half-second.wav'; // this is needed to trigger web audio audibility in some browsers
+                          if ( audio ) {
+                            audio.append(source);
+                            audio.addEventListener('playing', () => {
+                              DEBUG.debugAudio && console.log('audio playing ~~ for first time since page load, so clearing buffer');
+                              fetchedData = new Float32Array( 0 );
+                              audio.playing = true;
+                            });
+                            audio.addEventListener('waiting', () => audio.playing = false);
+                            audio.addEventListener('ended', () => audio.playing = false);
+                            activateAudio = async () => {
+                              DEBUG.debugAudio && console.log('called activate audio');
+                              audio.muted = false;
+                              audio.removeAttribute('muted');
+                              if ( true || !audio.playing ) {
+                                try {
+                                  DEBUG.debugAudio && console.log(`Trying to play...`);
+                                  await audio.play();
+                                  audio.playing = true;
+                                  send("ack");
+                                } catch(err) {
+                                  DEBUG.debugAudio && console.info(`Could not yet play audio`, err);
+                                  DEBUG.debugAudio && console.error(err + '');
+                                  DEBUG.debugAudio && console.error(err);
+                                  return;
+                                }
+                              }
+                              if ( CONFIG.removeAudioStartHandlersAfterFirstStart ) {
+                                Root.removeEventListener('pointerdown', activateAudio);
+                                Root.removeEventListener('touchend', activateAudio);
+                                DEBUG.debugAudio && console.log('Removed audio start handlers');
+                              }
+                            };
+                            setTimeout(activateAudio, 0);
+                            Root.addEventListener('pointerdown', activateAudio);
+                            Root.addEventListener('touchend', activateAudio);
+                            Root.addEventListener('click', activateAudio, {once:true});
+                            DEBUG.debugAudio && console.log('added handlers', Root, audio);
+                          } else {
+                            console.warn(`Audio element 'video#audio' not found inside:`, Root);
+                          }
                         }
-                        
-                        const audioBuffer = new Int16Array(msg.data);
-                        fetchedData = concat(fetchedData, audioBuffer);
-                        if ( !is_reading && fetchedData.length >= min_sample_size ) {
-                          readingLoop();
-                        }
-                      });
-
-                      ws.addEventListener('error', async err => {
-                        console.warn('Audio websocket client got error', err);
-                        state.audioConnected = false;
-                        audioReconnect(err);
-                        state.setTopState();
-                      });
-                    }
-
-                    async function audioReconnect(msg) {
-                      DEBUG.debugAudio && console.log(`Audio websocket waiting ${audioReconnectMs}ms...`, {msg});
-                      await sleep(audioReconnectMs);
-                      audioReconnectMs *= AUDIO_RECONNECT_MULTIPLIER;
-                      if ( audioReconnectMs <= AUDIO_RECONNECT_MAX ) {
-                        DEBUG.debugAudio && console.log(`Audio websocket attempting reconnect...`);
-                        setTimeout(connectAudio, 0); 
-                      } else {
-                        const keepTrying = confirm(
-                          "We haven't been about to connect to the audio service for a while. Should we keep trying?"
-                        );
-                        if ( keepTrying ) {
-                          audioReconnectMs = AUDIO_RECONNECT_MS;
-                          setTimeout(audioReconnect, 0);
-                        }
-                      }
-                    }
-
-                    function readingLoop() {
-                      if ( stopped || fetchedData.length < min_sample_size ) {
-                        is_reading = false;
-                        DEBUG.debugAudio && console.log('not playing');
-                        return;
-                      }
-
-                      is_reading = true;
-                      DEBUG.debugAudioAcks && console.log('reading');
-
-                      const audio_buffer = ctx.createBuffer(
-                        channels,
-                        fetchedData.length,
-                        sample_rate
-                      );
-
-                      try {
-                        DEBUG.debugAudioAcks && console.log(fetchedData.length);
-                        audio_buffer.copyToChannel( fetchedData, 0 );
-
+                        const audios = [];
+                        self.audios = audios;
+                        const wsUri = new URL(AUDIO);
+                        wsUri.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                        wsUri.hash = '';
+                        let ws;
+                        const channels = 1;
+                        const min_sample_duration = 0.5; // seconds;
+                        const sample_rate = 44100; // Hz;
+                        const min_sample_size = min_sample_duration * sample_rate;
+                        let chunk_size = 2**14;
+                        let counter = 1;
+                        let playing = false;
+                        let active = false;
+                        let ctx;
+                        let gain;
+                        let activeNode;
+                        let is_reading = false;
+                        let audioReconnectMs = AUDIO_RECONNECT_MS;
+                        let stopped = true;
                         fetchedData = new Float32Array( 0 );
 
-                        activeNode = ctx.createBufferSource();
-                        activeNode.buffer = audio_buffer;
-                        // ended not end
-                        activeNode.addEventListener('ended', () => {
-                          DEBUG.debugAudioAcks && console.log('node end');
-                          send("stop");
+                        const ensureResume = () => {
+                          if ( ! ctx ) return;
+                          ctx && ctx.resume();
+                          document.removeEventListener('click', ensureResume);
+                        };
+
+                        document.addEventListener('click', ensureResume);
+
+                        document.addEventListener('click', beginSound, {once: CONFIG.onlyStartAudioBeginSoundOnce });
+                        beginSound();
+
+                        function beginSound() {
+                          if ( ctx?.state == 'running' ) return;
+                          if ( ctx?.state == 'closed' ) ctx = null;
+                          if ( stopped || !ctx ) {
+                            stopped = false;
+                            active = true;
+                            ctx = new AudioContext({
+                              sampleRate: sample_rate
+                            });
+                            ctx.addEventListener('statechange', () => {
+                              if ( ctx.state == 'closed' ) return setTimeout(beginSound, 500);
+                              if ( ctx.state == 'suspended' ) return setTimeout(ensureResume, 500);
+                            });
+                            gain = ctx.createGain();
+                            gain.gain.value = Math.min(OPTIONS.audioGain, CONFIG.hearingProtectionMaxGain);
+                            gain.connect( ctx.destination );
+                          }
+
+                          connectAudio();
                           readingLoop();
-                        });
-                        activeNode.connect( gain );
+                        }
 
-                        activeNode.start( 0 );
-                        DEBUG.debugAudioAcks && console.log('playing');
-                      } catch(e) {
-                        console.warn(e);
-                      }
-                    }
+                        function connectAudio() {
+                          // 0 - CONNECTING, 1 - OPEN, 2 - CLOSING, 3 - CLOSED
+                          if ( ws?.readyState < 2 ) return;
+                          DEBUG.debugAudio && console.log(`Creating websocket...`);
+                          ws = new WebSocket(wsUri);
+                          DEBUG.debugAudio && console.log('Create ws');
+                          DEBUG.debugAudio && console.log(`Created`, ws);
+                          ws.binaryType = 'arraybuffer';
 
-                    function concat( arr1, arr2 ) {
-                      if( !arr2 || !arr2.length ) {
-                        return arr1 && arr1.slice();
-                      }
-                      const arr2_32 = new Float32Array( arr2.byteLength / 2 );
-                      const dv = new DataView( arr2.buffer );
-                      for( let i = 0, offset = 0; offset < arr2.byteLength; i++, offset += 2 ) {
-                        const v = dv.getInt16(offset, true);
-                        arr2_32[i] = v > 0 ? (v / 32767.0) : (v / 32768.0);
-                      }
-                      const out = new arr1.constructor( arr1.length + arr2_32.length );
-                      out.set( arr1 );
-                      out.set( arr2_32, arr1.length );
-                      DEBUG.debugAudioAcks && console.log('out length ' + out.length);
-                      return out;
-                    }
+                          ws.addEventListener('open', msg => {
+                            DEBUG.debugAudio && console.log('ws open');
+                            DEBUG.debugAudio && console.log(`Audio websocket connected`, msg);
+                            state.audioConnected = true;
+                            state.setTopState();
+                            audioReconnectMs = AUDIO_RECONNECT_MS;
+                            setTimeout(activateAudio, 0);
+                            readingLoop();
+                            state.refreshViews();
+                          });
 
-                    function send(o) {
-                      if ( typeof o === 'string' ) {
-                        ws.send(o);
-                      } else if ( o instanceof ArrayBuffer ) {
-                        ws.send(o);
-                      } else {
-                        ws.send(JSON.stringify(o));
-                      }
-                    }
+                          ws.addEventListener('close', msg => {
+                            DEBUG.debugAudio && console.log(`Audio websocket closing`, msg); 
+                            state.audioConnected = false;
+                            audioReconnectMs = AUDIO_RECONNECT_MS;
+                            setTimeout(audioReconnect, 0);
+                            state.setTopState();
+                          });
 
-                    function startPlaying() {
-                      DEBUG.debugAudio && console.log('start playing', playing, audios);
-                      if ( playing || !active ) return;
-                      console.warn(`startPlaying not implemented yet`);
+                          ws.addEventListener('message', async msg => {
+                            DEBUG.debugAudioAcks && console.log('client got msg %s', msg.data.length || msg.data.byteLength);
+                            send("ack");
+                            if ( typeof msg.data === "string" ) {
+                              DEBUG.debugAudioAck && console.log('audio ws message', msg.data);
+                              return;
+                            }
+                            
+                            const audioBuffer = new Int16Array(msg.data);
+                            fetchedData = concat(fetchedData, audioBuffer);
+                            if ( !is_reading && fetchedData.length >= min_sample_size ) {
+                              readingLoop();
+                            }
+                          });
+
+                          ws.addEventListener('error', async err => {
+                            console.warn('Audio websocket client got error', err);
+                            state.audioConnected = false;
+                            audioReconnect(err);
+                            state.setTopState();
+                          });
+                        }
+
+                        async function audioReconnect(msg) {
+                          DEBUG.debugAudio && console.log(`Audio websocket waiting ${audioReconnectMs}ms...`, {msg});
+                          await sleep(audioReconnectMs);
+                          audioReconnectMs *= AUDIO_RECONNECT_MULTIPLIER;
+                          if ( audioReconnectMs <= AUDIO_RECONNECT_MAX ) {
+                            DEBUG.debugAudio && console.log(`Audio websocket attempting reconnect...`);
+                            setTimeout(connectAudio, 0); 
+                          } else {
+                            const keepTrying = confirm(
+                              "We haven't been about to connect to the audio service for a while. Should we keep trying?"
+                            );
+                            if ( keepTrying ) {
+                              audioReconnectMs = AUDIO_RECONNECT_MS;
+                              setTimeout(audioReconnect, 0);
+                            }
+                          }
+                        }
+
+                        function readingLoop() {
+                          if ( stopped || fetchedData.length < min_sample_size ) {
+                            is_reading = false;
+                            DEBUG.debugAudio && console.log('not playing');
+                            return;
+                          }
+
+                          is_reading = true;
+                          DEBUG.debugAudioAcks && console.log('reading');
+
+                          const audio_buffer = ctx.createBuffer(
+                            channels,
+                            fetchedData.length,
+                            sample_rate
+                          );
+
+                          try {
+                            DEBUG.debugAudioAcks && console.log(fetchedData.length);
+                            audio_buffer.copyToChannel( fetchedData, 0 );
+
+                            fetchedData = new Float32Array( 0 );
+
+                            activeNode = ctx.createBufferSource();
+                            activeNode.buffer = audio_buffer;
+                            // ended not end
+                            activeNode.addEventListener('ended', () => {
+                              DEBUG.debugAudioAcks && console.log('node end');
+                              send("stop");
+                              readingLoop();
+                            });
+                            activeNode.connect( gain );
+
+                            activeNode.start( 0 );
+                            DEBUG.debugAudioAcks && console.log('playing');
+                          } catch(e) {
+                            console.warn(e);
+                          }
+                        }
+
+                        function concat( arr1, arr2 ) {
+                          if( !arr2 || !arr2.length ) {
+                            return arr1 && arr1.slice();
+                          }
+                          const arr2_32 = new Float32Array( arr2.byteLength / 2 );
+                          const dv = new DataView( arr2.buffer );
+                          for( let i = 0, offset = 0; offset < arr2.byteLength; i++, offset += 2 ) {
+                            const v = dv.getInt16(offset, true);
+                            arr2_32[i] = v > 0 ? (v / 32767.0) : (v / 32768.0);
+                          }
+                          const out = new arr1.constructor( arr1.length + arr2_32.length );
+                          out.set( arr1 );
+                          out.set( arr2_32, arr1.length );
+                          DEBUG.debugAudioAcks && console.log('out length ' + out.length);
+                          return out;
+                        }
+
+                        function send(o) {
+                          if ( typeof o === 'string' ) {
+                            ws.send(o);
+                          } else if ( o instanceof ArrayBuffer ) {
+                            ws.send(o);
+                          } else {
+                            ws.send(JSON.stringify(o));
+                          }
+                        }
+
+                        function startPlaying() {
+                          DEBUG.debugAudio && console.log('start playing', playing, audios);
+                          if ( playing || !active ) return;
+                          console.warn(`startPlaying not implemented yet`);
+                        }
+                      }
                     }
                   }
                 }
+              });
+              setupAudioIframe();
+            }
+
+            async function setupAudioElement(type = 'audio/wav') {
+              let audio;
+              try {
+                DEBUG.debugAudio && console.log({AUDIO, status:'waiting for audio element'});
+                await untilTrueOrTimeout(() => document.querySelector('bb-view')?.shadowRoot?.querySelector?.('video#audio'), 75);
+                Root = document.querySelector('bb-view').shadowRoot;
+                audio = Root.querySelector('video#audio');
+                setAudioSource(AUDIO);
+                DEBUG.debugAudio && console.log({'status': 'tried setting audio source', 'audio?': audio, AUDIO});
+                let existingTimer = null;
+                let waiting = false;
+                if ( audio ) {
+                  //audio.append(source);
+                  // Event listener for when audio is successfully loaded
+                  audio.addEventListener('loadeddata', async () => {
+                    console.log('Audio loaded');
+                    await audio.play();
+                    audio.playing = true;
+                  });
+
+                  audio.addEventListener('playing', () => {
+                    audio.playing = true;
+                    audio.hasError = false;
+                  });
+                  // Event listener for playing state
+                  audio.addEventListener('play', () => {
+                    audio.playing = true;
+                    audio.hasError = false;
+                    console.log('Audio playing');
+                  });
+
+                  audio.addEventListener('waiting', () => audio.playing = false);
+                  audio.addEventListener('ended', () => {
+                    audio.playing = false;
+                    DEBUG.debugAudio && console.log(`Audio stream ended`);
+                    existingTimer = setTimeout(startAudioStream, 100);
+                  });
+                  audio.addEventListener('error', err => {
+                    audio.playing = false;
+                    audio.hasError = true;
+                    DEBUG.debugAudio && console.log(`Audio stream errored`, err);
+                  });
+                  // Event listener for pause state
+                  audio.addEventListener('pause', () => {
+                    audio.playing = false;
+                    console.log('Audio paused');
+                  });
+
+                  const activateAudio = async () => {
+                    DEBUG.debugAudio && console.log('called activate audio');
+                    if ( audio.muted || audio.hasAttribute('muted') ) {
+                      audio.muted = false;
+                      audio.removeAttribute('muted');
+                    }
+                    await sleep(1000);
+                    if ( !audio.playing ) {
+                      try {
+                        startAudioStream();
+                        //send("ack");
+                      } catch(err) {
+                        DEBUG.debugAudio && console.info(`Could not yet play audio`, err); 
+                        DEBUG.debugAudio && console.error(err + '');
+                        DEBUG.debugAudio && console.error(err);
+                        return;
+                      }
+                    }
+                    if ( CONFIG.removeAudioStartHandlersAfterFirstStart /*|| CONFIG.isOnion */ ) {
+                      document.removeEventListener('pointerdown', activateAudio);
+                      document.removeEventListener('touchend', activateAudio);
+                      DEBUG.debugAudio && console.log('Removed audio start handlers');
+                    }
+                  };
+                  document.addEventListener('pointerdown', activateAudio);
+                  document.addEventListener('touchend', activateAudio);
+                  document.addEventListener('click', activateAudio, {once: CONFIG.onlyStartAudioBeginSoundOnce });
+                  DEBUG.debugAudio && console.log('added handlers', document, audio);
+
+                  async function startAudioStream() {
+                    setAudioSource(AUDIO);
+                  }
+                } else {
+                  console.warn(`Audio element 'video#audio' not found inside:`, Root);
+                }
+              } catch(e) {
+                console.error(`Issue setting up audio element`, e, AUDIO, audio);
+              }
+
+              function setAudioSource(src) {
+                // Check if the audio is already loading or playing the same source
+                if (audio.src === src && !audio.error && ! audio.hasError && (audio.readyState > 2 || audio.playing)) {
+                  console.log('Audio is already playing or loading this source');
+                  return;
+                }
+
+                // Reset error state and set the new source
+                audio.hasError = null;
+                audio.src = src;
               }
             }
-          });
+
+            async function setupAudioIframe() {
+              DEBUG.debugAudio && console.log('Begginning create of audio login iframe...');
+              const MAX_RETRIES = 25;
+              let retry = 0;
+              DEBUG.debugAudio && console.log(`Waiting for root element...`);
+              await untilTrue(() => !!document.querySelector('bb-view')?.shadowRoot, 1000, 600);
+              Root = document.querySelector('bb-view').shadowRoot;
+              DEBUG.debugAudio && console.log(`Root element arrived. Creating iframe...`);
+              const aif = document.createElement('iframe');
+              aif.id = 'audio-login';
+              DEBUG.debugAudio && console.log(`Iframe created. Constructing url and waiting for necessary components...`);
+              const src = new URL(AUDIO.href);
+              src.pathname = '/login';
+              src.searchParams.set('token', localStorage.getItem(CONFIG.sessionTokenFileName) || state.sessionToken);
+              src.searchParams.set('localCookie', await state.localCookie);
+              DEBUG.debugAudio && console.log(`All components ready. Login url composed. Attaching to document and connecting...`);
+              Root.appendChild(aif);
+              // wait 4 seconds to receive response
+              untilTrueOrTimeout(() => state.audioMessageReceived, 4)
+                .then(() => {
+                  DEBUG.debugAudio && console.log(`Audio message received. We have connected to audio service. Audio WebSocket should connect soon.`)
+                }).catch(async (err) => {
+                  DEBUG.debugAudio && console.error(err);
+                  DEBUG.debugAudio && console.log(`Connecting failed. Retrying?`);
+                  await sleep(1000);
+                  retry++;
+                  if ( retry > MAX_RETRIES ) {
+                    DEBUG.debugAudio && console.log(`Cannot retry. Max attempts exceeded.`);
+                    return;
+                  }
+                  DEBUG.debugAudio && console.log(`Will retry`);
+                  aif.remove();
+                  setTimeout(setupAudioIframe, 0);
+                  DEBUG.debugAudio && console.log(`${retry}th connect attempt started.`);
+              });
+              aif.addEventListener('load', () => {
+                DEBUG.debugAudio && console.log(`Iframe 'load' event. But this provides no information on whether Audio login is successful.`);
+              });
+              aif.src = src;
+              DEBUG.debugAudio && console.log(`Initial connect attempt started`);
+            }
+          } catch(e) {
+            console.warn(`Error setting up audio`, e);
+            return false;
+          }
+
+          return true;
+        }
+        globalThis.setupAudio = setupAudio;
 
         // input
           queue.addMetaListener('selectInput', meta => handleSelectMessage(meta, state));
           queue.addMetaListener('selectInput', meta => console.log({meta}));
           queue.addMetaListener('keyInput', meta => handleKeysCanInputMessage(meta, state));
           queue.addMetaListener('favicon', meta => handleFaviconMessage(meta, state));
-          //queue.addMetaListener('navigated', () => canKeysInput());
-          queue.addMetaListener('navigated', async ({navigated:{targetId}}) => {
-            await resetFavicon({targetId}, state);
-            // reset favicon event to send to remote
-            //initialGetFavicon(targetId);
-            //getFavicon(targetId);
-          });
+          queue.addMetaListener('navigated', () => canKeysInput());
+          queue.addMetaListener('resetFavicon', ({resetFavicon:{targetId}}) => resetFavicon({targetId}, state));
 
         //queue.addMetaListener('navigated', meta => takeShot(meta, state));
 
@@ -780,18 +1179,120 @@
           });
           queue.addMetaListener('navigated', meta => resetLoadingIndicator(meta, state));
 
-        if ( DEBUG.val >= DEBUG.med ) {
-          queue.addMetaListener('vm', meta => console.log(meta));
-          queue.addMetaListener('modal', meta => console.log(meta));
-          queue.addMetaListener('navigated', meta => console.log(meta));
-          queue.addMetaListener('changed', meta => console.log(meta));
-          queue.addMetaListener('created', meta => console.log(meta));
-          queue.addMetaListener('attached', meta => console.log(meta));
-          queue.addMetaListener('detached', meta => console.log(meta));
-          queue.addMetaListener('destroyed', meta => console.log(meta));
-          queue.addMetaListener('crashed', meta => console.log(meta));
-          queue.addMetaListener('consoleMessage', meta => console.log(meta));
-        }
+        // extensions
+          queue.addMetaListener('installExtension', ({installExtension})  => {
+            COMMON.delayUnload = false;
+            globalThis.purchaseClicked = true;
+            state.viewState.modalComponent.openModal({
+              modal: {
+                type: 'notice',
+                title: 'CloudTabs Extensions',
+                message: 'Installing your extension now. Close this message to reload and check progress.'
+              }
+            });
+            state.viewState.modalComponent.addEventListener(
+              'click', 
+              () => {
+                const maxWaits = 150;
+                let waits = 0;
+                //setTimeout(() => location.reload(), 6242), {once:true, capture:true};
+                setInterval(async () => {
+                  const {isTor} = await uberFetch('/isTor').then(async r => await r.json());
+                  waits++;
+                  if ( waits > maxWaits ) {
+                    alert(`Something weird happened and your browser did not seem to restart after installing the extension.`);
+                  }
+                  location.reload();
+                }, 2003);
+              },
+              {once: true, capture: true}
+            );
+          });
+          queue.addMetaListener('deleteExtension', ({removeExtension,deleteExtension})  => {
+            COMMON.delayUnload = false;
+            globalThis.purchaseClicked = true;
+            state.viewState.modalComponent.openModal({
+              modal: {
+                type: 'notice',
+                title: 'CloudTabs Extensions',
+                message: 'Removing your extension now. Close this message to reload and check progress.'
+              }
+            });
+            state.viewState.modalComponent.addEventListener(
+              'click', 
+              () => {
+                const maxWaits = 150;
+                let waits = 0;
+                //setTimeout(() => location.reload(), 6242), {once:true, capture:true};
+                setInterval(async () => {
+                  const {isTor} = await uberFetch('/isTor').then(async r => await r.json());
+                  waits++;
+                  if ( waits > maxWaits ) {
+                    alert(`Something weird happened and your browser did not seem to restart after installing the extension.`);
+                  }
+                  location.reload();
+                }, 2003);
+              },
+              {once: true, capture: true}
+            );
+          });
+          queue.addMetaListener('modifyExtension', ({modifyExtension})  => {
+            COMMON.delayUnload = false;
+            globalThis.purchaseClicked = true;
+            state.viewState.modalComponent.openModal({
+              modal: {
+                type: 'notice',
+                title: 'CloudTabs Extensions',
+                message: 'Modifying your extension now. Close this message to reload and check progress.'
+              }
+            });
+            state.viewState.modalComponent.addEventListener(
+              'click', 
+              () => {
+                const maxWaits = 150;
+                let waits = 0;
+                //setTimeout(() => location.reload(), 6242), {once:true, capture:true};
+                setInterval(async () => {
+                  const {isTor} = await uberFetch('/isTor').then(async r => await r.json());
+                  waits++;
+                  if ( waits > maxWaits ) {
+                    alert(`Something weird happened and your browser did not seem to restart after installing the extension.`);
+                  }
+                  location.reload();
+                }, 2003);
+              },
+              {once: true, capture: true}
+            );
+          });
+          queue.addMetaListener('createTab', ({createTab}) => {
+            console.log({createTab});
+            //alert('Open Extension: ' + createTab?.opts?.url);
+            state.createTab(null, createTab.opts.url);
+          });
+
+        // plugins
+          if ( DEBUG.detectPuterAbility ) {
+            queue.addMetaListener('hasPuterAbility', meta => plugins.handlePuterAbility(meta, state));
+            queue.addMetaListener('puterCustomDownload', meta => plugins.handlePuterAbility(meta, state));
+          }
+          queue.addMetaListener('ctCustomDownload', meta => {
+            const {ctCustomDownload} = meta;
+            const {url} = ctCustomDownload;
+            downloadFile(url);
+          });
+
+          if ( DEBUG.val >= DEBUG.med ) {
+            queue.addMetaListener('vm', meta => console.log(meta));
+            queue.addMetaListener('modal', meta => console.log(meta));
+            queue.addMetaListener('navigated', meta => console.log(meta));
+            queue.addMetaListener('changed', meta => console.log(meta));
+            queue.addMetaListener('created', meta => console.log(meta));
+            queue.addMetaListener('attached', meta => console.log(meta));
+            queue.addMetaListener('detached', meta => console.log(meta));
+            queue.addMetaListener('destroyed', meta => console.log(meta));
+            queue.addMetaListener('crashed', meta => console.log(meta));
+            queue.addMetaListener('consoleMessage', meta => console.log(meta));
+          }
 
         // vm
           queue.addMetaListener('vm', ({vm}) => {
@@ -820,20 +1321,24 @@
             });
 
           queue.addMetaListener('created', meta => {
-            if ( meta.created.type == 'page') {
+            const url = new URL(meta.created.url);
+            if ( AttachmentTypes.has(meta.created.type) && ! HIDDEN_DOMAINS.has(url.hostname) ) {
               meta.created.hello = 'oncreated';
-              const activate = () => activateTab(null, meta.created, {notify: false, forceFrame:true})
+              const activate = () => {
+                DEBUG.activateTab && console.log(`Going activate for `, meta.created);
+                activateTab(null, meta.created, {notify: false, forceFrame:true})
+              };
               const tab = findTab(meta.created.targetId);
               if ( tab ) {
                 if ( DEBUG.activateNewTab ) {
                   DEBUG.val && console.log('Setting activate to occur after delay for new tab');
-                  setTimeout(activate, LONG_DELAY);
+                  setTimeout(activate, NEW_TAB_ACTIVATE_DELAY);
                 }
               } else {
                 DEBUG.activateDebug && console.warn('created tab not found in our list', meta.created);
                 if ( DEBUG.activateNewTab ) {
                   DEBUG.activateDebug && console.log('Pushing activate for new tab');
-                  state.updateTabsTasks.push(activate);
+                  state.updateTabsTasks.push(() => setTimeout(activate, NEW_TAB_ACTIVATE_DELAY));
                 }
                 updateTabs();
               }
@@ -841,8 +1346,13 @@
           });
           queue.addMetaListener('attached', meta => {
             const attached = meta.attached.targetInfo;
-            if ( attached.type == 'page' ) {
+            const url = attached.url ? new URL(attached.url) : '';
+            if ( AttachmentTypes.has(attached.type) && ! HIDDEN_DOMAINS.has(url.hostname) ) {
               state.attached.add(attached.targetId);
+              const activate = () => {
+                DEBUG.activateTab && console.log(`Going activate for `, attached);
+                activateTab(null, attached, {notify: false, forceFrame:true})
+              };
 
               if ( state.useViewFrame ) {
                 //sizeBrowserToBounds(state.viewState.viewFrameEl, attached.targetId);
@@ -851,6 +1361,10 @@
                 emulateNavigator();
               }
               //state.updateTabsTasks.push(() => initialGetFavicon(attached.targetId));
+              if ( DEBUG.activateNewTab ) {
+                DEBUG.activateDebug && console.log('Pushing activate for new tab');
+                state.updateTabsTasks.push(() => setTimeout(activate, NEW_TAB_ACTIVATE_DELAY));
+              }
               updateTabs();
             }
           });
@@ -875,7 +1389,7 @@
             if ( tab ) {
               if ( DEBUG.activateNewTab ) {
                 (DEBUG.val || DEBUG.activateDebug) && console.log('Refered -> Activate now');
-                activate();
+                setTimeout(activate, NEW_TAB_ACTIVATE_DELAY);
               }
             } else {
               DEBUG.activateDebug && console.warn(
@@ -884,7 +1398,7 @@
               );
               if ( DEBUG.activateNewTab ) {
                 DEBUG.activateDebug && console.log('Refered -> Pushing activate for new tab');
-                state.updateTabsTasks.push(activate);
+                state.updateTabsTasks.push(() => setTimeout(activate, NEW_TAB_ACTIVATE_DELAY));
               }
               updateTabs();
             }
@@ -921,23 +1435,40 @@
               /*
                 otherButton: {
                   title: 'Buy',
-                  onclick: () => window.top.open('https://buy.stripe.com/dR615g7hL0Mjeek5kx', "_blank")
+                  onclick: () => globalThis.window.open('https://buy.stripe.com/dR615g7hL0Mjeek5kx', "_blank")
                 },
               */
               title: "SecureView\u2122 Enabled",
             };
-            state.viewState.modalComponent.openModal({modal});
+            CONFIG.showModalOnFileDownload && state.viewState.modalComponent.openModal({modal});
           });
 
           queue.addMetaListener('secureview', ({secureview}) => {
             DEBUG.val && console.log('secureview', secureview);
-            const {url} = secureview;
+            let {url} = secureview;
             if ( url ) {
+              if ( CONFIG.isDNSFacade ) {
+                url = new URL(url);
+                const subs = url.hostname.split('.');
+                const port = url.port;
+                subs.unshift(`p${port}`);
+                url.port = url.protocol == 'https:' ? 443 : 80;
+                url.hostname = subs.join('.');
+              }
               if ( DEBUG.useWindowOpenForSecureView ) {
-                window.top.open(url);
+                globalThis.window.open(url);
               } else {
                 createTab(null, url);
               }
+            }
+          });
+
+          queue.addMetaListener('bandwidthIssue', ({bandwidthIssue}) => {
+            const showBandwidthIssue = bandwidthIssue == 'yes';
+            if ( state.showBandwidthIssue != showBandwidthIssue ) {
+              DEBUG.logBandwidthIssueChanges && console.log({bandwidthIssue});
+              state.showBandwidthIssue = showBandwidthIssue;
+              setState('bbpro', state);
             }
           });
 
@@ -949,37 +1480,52 @@
           });
 
         // HTTP auth
-        queue.addMetaListener('authRequired', ({authRequired}) => {
-          const {requestId} = authRequired;
-          const modal = {
-            requestId,
-            type: 'auth',
-            message: `Provide credentials to continue`,
-            title: `HTTP Authentication`,
-          };
-          state.viewState.modalComponent.openModal({modal});
-        });
+          queue.addMetaListener('authRequired', ({authRequired}) => {
+            const {requestId} = authRequired;
+            const modal = {
+              requestId,
+              type: 'auth',
+              message: `Provide credentials to continue`,
+              title: `HTTP Authentication`,
+            };
+            state.viewState.modalComponent.openModal({modal});
+          });
 
         // File chooser 
-        queue.addMetaListener('fileChooser', ({fileChooser}) => {
-          const {sessionId, mode, accept, csrfToken} = fileChooser;
-          DEBUG.val && console.log('client receive file chooser notification', fileChooser);
-          const modal = {
-            sessionId, mode, accept, csrfToken,
-            type: 'filechooser',
-            message: `Securely send files to the remote page.`,
-            title: `File Upload`,
-          };
-          DEBUG.val && console.log({fileChooserModal:modal});
-          state.viewState.modalComponent.openModal({modal});
-        });
-      
-      // make this so we can call it on resize
-        window._voodoo_asyncSizeTab = async (opts) => {
-          await sleep(40);
-          return sizeTab(opts);
-        };
+          queue.addMetaListener('fileChooser', ({fileChooser}) => {
+            const {sessionId, mode, accept} = fileChooser;
+            let {token} = fileChooser;
+            if ( ! token ) {
+              token = globalThis._sessionToken();
+            }
+            DEBUG.val && console.log('client receive file chooser notification', fileChooser);
+            if ( globalThis.hasPuterAbility ) {
+              globalThis.parent.parent.postMessage({request:{puterCustomUpload:{fileOptions:{
+                accept,
+                multiple:mode=='selectMultiple'
+              }}}}, '*');
+              plugins.setFileContext({token, sessionId});
+            } else {
+              const modal = {
+                sessionId, mode, accept, token,
+                type: 'filechooser',
+                message: `Securely send files to the remote page.`,
+                title: `File Upload`,
+              };
+              DEBUG.val && console.log({fileChooserModal:modal});
+              state.viewState.modalComponent.openModal({modal});
+            }
+          });
 
+          queue.addMetaListener('fileChooserClosed', ({fileChooserClosed}) => {
+            console.log('File chooser closed', fileChooserClosed);
+            state.viewState.modalComponent.onlyCloseModal(state.viewState.modalComponent.state);
+            // update tabs (to trigger vm paused warning if it's still paused
+            // 1 second after a modal closes only if there is no other modal open then
+            clearTimeout(modaler);
+            modaler = setTimeout(() => !state.viewState.currentModal && updateTabs(), 1000);
+          });
+      
       // bond tasks 
         canvasBondTasks.push(indicateNoOpenTabs);
         canvasBondTasks.push(installZoomListener);
@@ -992,6 +1538,21 @@
         bondTasks.push(canKeysInput);
         bondTasks.push(installTopLevelKeyListeners);
 
+        installResizeListener();
+
+      // extra tasks
+        if ( DEBUG.debugResize || CONFIG.ensureFrameOnResize ) {
+          /*
+          globalThis.window.addEventListener('resize', async event => {
+            DEBUG.debugResize && console.info(`Received resize event from local browser (this device)`, event);
+            // The below is already called in resize_helper.js so no need to double it up
+            await untilSizeStabilizes(state.viewState.canvasEl);
+            await sleep(40);
+            globalThis._voodoo_asyncSizeTab({forceFrame:true,resetRequested:true});
+          });
+          */
+        }
+
       const preInstallView = {queue};
 
       for( const task of preInstallTasks ) {
@@ -1002,10 +1563,9 @@
         }
       }
 
-      let Root = document;
-
       bangFig({
-        componentsPath: './voodoo/src/components'
+        componentsPath: './voodoo/src/components',
+        useMagicClone: true
       });
       await bangLoaded();
 
@@ -1028,6 +1588,7 @@
             DEFAULT_FAVICON
           });
           setState('bbpro', state);
+
           use('bb-view'); 
           use('bb-bar');
           use('bb-tabs'); 
@@ -1039,11 +1600,15 @@
           use('bb-omni-box');
           use('bb-top-bar');
           use('bb-modals');
-          use('bb-resize-button');
-          use('bb-settings-button');
+          use('bb-bw-spinner');
+
+          DEBUG.extensionsAssemble &&         use('bb-extensions-button');
+          DEBUG.clientsCanResetViewport &&    use('bb-resize-button');
+          CONFIG.settingsButton &&            use('bb-settings-button');
+
           const bb = document.querySelector('bb-view');
-          if ( !bb.shadowRoot ) {
-            await untilTrue(() => !!document.querySelector('bb-view')?.shadowRoot);
+          if ( !bb?.shadowRoot ) {
+            await untilTrueOrTimeout(() => !!document.querySelector('bb-view')?.shadowRoot, 120);
           }
           Root = document.querySelector('bb-view').shadowRoot;
         } catch(e) {
@@ -1052,6 +1617,7 @@
       }
 
       const api = {
+        untilLoaded, 
         back: () => 1,
         forward: () => 1,
         reload: () => 1, 
@@ -1084,34 +1650,65 @@
       }
 
       window.addEventListener('offline', () => {
-        setState('bbpro', state);
-        writeCanvas("No connection to server");
+        setTimeout(() => {
+          setState('bbpro', state);
+          writeCanvas("No connection to server");
+        },0);
       });
 
       window.addEventListener('online', () => {
-        setState('bbpro', state);
-        writeCanvas("Online. Connecting...");
+        setTimeout(() => {
+          try {
+            state.Connectivity.checker.status = 'online';
+          } catch(e) {
+            console.warn(`Connectivity checker has error`, e); 
+          }
+          setState('bbpro', state);
+          writeCanvas("Online. Connecting...");
+        }, 0);
       });
 
       if ( activeTarget ) {
+        DEBUG.activateDebug && console.log(`Activate to be called`);
+        DEBUG.activateDebug && alert((new Error).stack);
         setTimeout(() => activateTab(null, {hello:'onload', targetId:activeTarget}, {forceFrame:true}), LONG_DELAY);
       }
+
+      refreshViews();
 
       return poppetView;
 
       // closures
+        function downloadFile(url) {
+          const a = document.createElement('a');
+          a.href = url;
+          a.target = '_blank';
+          a.download = url.split('/').pop();  // Sets the download filename to the last segment of the URL
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+
+        async function refreshViews() {
+          await untilHuman(() => state?.viewState?.bbView?.classList?.contains?.('bang-styled'));
+          await untilHuman(() => state?.Connectivity?.checker?.status == 'online');
+          state.activateTab();
+          DEBUG.val && DEBUG.useAlerts && alert('Performed refresh views');
+          DEBUG.val && console.info('Performed refresh views');
+        }
+
         function checkResults() {
           queue.checkResults();
         }
 
-        /*function doShot() {
+        function doShot() {
           setTimeout(() => {
             queue.send({
               type: "doShot",
               synthetic: true
             });
           }, SHORT_DELAY);
-        }*/
+        }
 
         function runUpdateTabs() {
           DEBUG.debugTabs && console.log(`Run update tabs called`);
@@ -1170,7 +1767,7 @@
             console.warn(`No canvas found yet`);
             return;
           }
-          ctx.fillStyle = CONFIG.darkMode ? 'black' : 'white';
+          ctx.fillStyle = CONFIG.darkMode ? 'gray' : 'silver';
           if ( !noClear ) {
             ctx.fillRect(0, 0, canv.width, canv.height);
           }
@@ -1184,6 +1781,17 @@
           ctx.fillText(text, x, y);
         }
 
+        function emulateActive(targetId, yesOrNo = true) {
+          queue.send({
+            command: {
+              name: "Emulation.setFocusEmulationEnabled",
+              params: {
+                enabled: yesOrNo
+              },
+            }
+          });
+        }
+
         function writeDocument(html, frameId, sessionId) {
           queue.send({
             type: 'setDocument',
@@ -1192,8 +1800,37 @@
           });
         }
 
+        function execute(expression, {contextId, returnByValue = true}) {
+          queue.send({
+            command: {
+              name: "Runtime.evaluate",
+              params: {
+                expression,
+                contextId,
+                returnByValue
+              }
+            }
+          });
+        }
+
+        async function untilLoaded() {
+          let bb = document.querySelector('bb-view');
+          if ( !bb?.shadowRoot ) {
+            await untilTrueOrTimeout(() => !!document.querySelector('bb-view')?.shadowRoot, 120);
+          }
+          bb = document.querySelector('bb-view');
+          await bb.untilLoaded();
+        }
+
+        async function getViewport() {
+          await untilLoaded();  
+          const vp = await getBounds();
+          vp.mobile = deviceIsMobile();
+          return vp;
+        }
+
         function clearViewport() {
-	  return;
+          //return;
           if ( state.useViewFrame ) {
             try {
               state.viewState.viewFrameEl.contentDocument.body.innerHTML = ``;
@@ -1203,53 +1840,142 @@
           } else {
             const canv = state.viewState.canvasEl;
             const ctx = state.viewState.ctx;
-            ctx.fillStyle = CONFIG.darkMode ? 'black' : 'white';
+            ctx.fillStyle = CONFIG.darkMode ? 'gray' : 'silver';
             ctx.fillRect(0, 0, canv.width, canv.height);
           }
         }
 
         function sendKey(keyEvent) {
+          if ( DEBUG.debugKeyEvents ) {
+            //console.info(`[sendKey]: got event: ${keyEvent.key} (${keyEvent.type.slice(3)})`, keyEvent);
+          }
           const {viewState} = state;
-          if ( ! ( viewState.shouldHaveFocus || document.deepActiveElement == viewState.omniBoxInput ) ) {
+          if ( CONFIG.alwaysSendTopLevel || ! ( viewState.shouldHaveFocus || document.deepActiveElement == viewState.omniBoxInput ) ) {
             let ev = keyEvent;
-            if ( ev.key == "Tab" || ev.key == "Enter" ) {
+            if ( ev.key == "Tab" ) {
               // do nothing
             } else{
+              DEBUG.debugKeyEvents && console.info(`[sendKey]: sending event: ${keyEvent.key}`, keyEvent);
               H(ev);
             }
           }
         }
 
+        function installResizeListener() {
+          window.addEventListener('resize', debounce(() => {
+            DEBUG.debugResize && console.log(`Going resize after debounce`);
+            sizeTab();
+            reactivateCurrentTab({noResize: true});
+          }, 1000));
+        }
+
+        function reactivateCurrentTab(opts) {
+          activateTab(null, activeTab(), opts);
+        }
+
         function installTopLevelKeyListeners() {
-          if ( ! deviceIsMobile() ) {
+          if ( state.topLevelInstalled ) return;
+          state.topLevelInstalled = true;
+          if ( ! deviceIsMobile() && CONFIG.useTopLevelSendKeyListeners ) {
             self.addEventListener('keydown', sendKey); 
-            self.addEventListener('keypress', sendKey);
+            //self.addEventListener('keypress', state.pressKey);
             self.addEventListener('keyup', sendKey); 
+          }
+          if ( CONFIG.useTopLevelControlKeyListeners ) {
+            console.log('Install tlckl');
+            document.addEventListener('keydown', event => {
+              if ( !event.target.matches('body') || state.viewState.shouldHaveFocus ) return;
+              if ( event.code == "Space" ) {
+                state.H({
+                  type: 'wheel',
+                  target: state.viewState.canvasEl,
+                  pageX: 0,
+                  pageY: 0,
+                  clientX: 0,
+                  clientY: 0,
+                  deltaMode: 2,
+                  deltaX: 0, 
+                  contextId: state.viewState.latestScrollContext,
+                  deltaY: event.shiftKey ? -0.618 : 0.618
+                });
+                //event.preventDefault();
+              } else if ( event.key == "Tab" ) {
+                state.retargetTab(event);
+              } else if ( event.key == "Enter" ) {
+                H(event);
+              }
+            });
+            document.addEventListener('keyup', event => {
+              if ( !event.target.matches('body') || state.viewState.shouldHaveFocus ) return;
+              if ( event.key == "Enter" ) {
+                H(event);
+              }
+            });
           }
         }
 
         function installSafariLongTapListener(el) {
+          if ( state.safariLongTapInstalled ) return;
           const FLAGS = {passive:true, capture:true};
           const MIN_DURATION = CTX_MENU_THRESHOLD;
-          const MAX_MOVEMENT = 20;
+          const MAX_MOVEMENT = 24;
+          let triggered = false;
+          let maxMovement = 0;
           let lastStart;
           let lastE;
+          let triggerTimer;
+          let expireIgnoreTimer;
+          let timeStarted = 0;
           el.addEventListener('touchstart', ts => {
-            DEBUG.debugContextMenu && console.log(`Starting Safari context menu trigger timer...`);
+            DEBUG.debugContextMenu && console.log(`Touchstart`);
+            triggered = false;
+            timeStarted = Date.now();
+            maxMovement = 0;
             lastStart = ts;
             lastE = null;
-            setTimeout(() => {
-              triggerContextMenuUnlessMoved();
+            if ( triggerTimer ) clearTimeout(triggerTimer);
+            DEBUG.debugContextMenu && console.log(`Starting Safari context menu trigger timer...`);
+            triggerTimer = setTimeout(() => {
+              triggerContextMenuUnlessMoved(ts, 'timer');
             }, CTX_MENU_THRESHOLD);
           }, FLAGS);
+
           el.addEventListener('touchmove', tm => {
+            DEBUG.debugContextMenu && console.log(`Touchmove`);
             lastE = tm;
+            const touch1 = lastStart.changedTouches[0];
+            const touch2 = tm.changedTouches[0];
+            const movement = Math.hypot(
+              touch2.pageX - touch1.pageX,
+              touch2.pageY - touch1.pageY
+            );
+
+            maxMovement = Math.max(maxMovement, movement);
+            DEBUG.debugContextMenu && console.log({maxMovement});
+            if ( maxMovement > MAX_MOVEMENT ) {
+              DEBUG.debugContextMenu && console.log(`Clearing trigger timer.`);
+              clearTimeout(triggerTimer);
+            }
             triggerContextMenuIfLongEnough(tm);
           }, FLAGS);
-          el.addEventListener('touchend', triggerContextMenuIfLongEnough, FLAGS);
-          el.addEventListener('touchcancel', triggerContextMenuIfLongEnough, FLAGS);
+
+          el.addEventListener('touchend', te => {
+            DEBUG.debugContextMenu && console.log(`Touchend`);
+            if ( triggerTimer ) clearTimeout(triggerTimer);
+            triggerContextMenuIfLongEnough(te);
+          }, FLAGS)
+
+          el.addEventListener('touchcancel', tc => {
+            DEBUG.debugContextMenu && console.log(`Touchcancel`);
+            if ( triggerTimer ) clearTimeout(triggerTimer);
+            triggerContextMenuIfLongEnough(tc);
+          }, FLAGS);
+
+          state.safariLongTapInstalled = true;
 
           function triggerContextMenuIfLongEnough(tf) {
+            DEBUG.debugContextMenu && console.log(`Maybe triggering unless long enough`, {triggered});
+            if ( triggered ) return;
             const touch1 = lastStart.changedTouches[0];
             let movement = 0;
             let duration = CTX_MENU_THRESHOLD;
@@ -1261,22 +1987,34 @@
                 touch2.pageY - touch1.pageY
               );
             // time
-              duration = tf.timeStamp - lastStart.timeStamp;
+              duration = Date.now() - timeStarted;
 
-            if ( duration >= MIN_DURATION && movement <= MAX_MOVEMENT ) {
+            DEBUG.debugContextMenu && console.log({duration, movement, maxMovement});
+
+            if ( duration >= MIN_DURATION && movement <= MAX_MOVEMENT && maxMovement <= MAX_MOVEMENT ) {
+              triggered = true;
+              DEBUG.debugContextMenu && console.log(`Triggering Safari context menu because not moved and long enough...`);
               /**
               lastStart.preventDefault();
               tf && tf.preventDefault();
               **/
               const {pageX,pageY,clientX,clientY} = touch1;
-              el.dispatchEvent(new CustomEvent('contextmenu', {detail:{pageX,pageY,clientX,clientY}}));
+              console.log({pageX,pageY,clientX,clientY});
+              el.dispatchEvent(new CustomEvent('contextmenu', {detail:{pageX, pageY, clientX, clientY}}));
             }
           }
 
-          function triggerContextMenuUnlessMoved() {
+          function triggerContextMenuUnlessMoved(event, timer) {
+            DEBUG.debugContextMenu && console.log(`Maybe triggering unless moved`, {triggered});
+            if ( triggered ) return;
             const touch1 = lastStart.changedTouches[0];
-            const tf = lastE;
-            if ( ! lastE ) return;
+            const tf = lastE || event;
+            if ( ! lastE && ! timer ) {
+              DEBUG.debugContextMenu && console.log(
+                `Bailing out of trigger because not initiated by timer and no last (non touchstart) event`
+              );
+              return;
+            }
             let movement = 0;
 
             // space 
@@ -1286,15 +2024,21 @@
                 touch2.pageY - touch1.pageY
               );
             // time
-            if ( movement <= MAX_MOVEMENT ) {
-              DEBUG.debugContextMenu && console.log(`Triggering Safari context menu...`);
-              /**
-              lastStart.preventDefault();
-              tf && tf.preventDefault();
-              **/
+            if ( movement <= MAX_MOVEMENT && maxMovement <= MAX_MOVEMENT ) {
+              triggered = true;
+              DEBUG.debugContextMenu && console.log(`Triggering Safari context menu because already long enough and not moved...`);
+              if ( timer ) {
+                clearTimeout(expireIgnoreTimer);
+                state.ignoreNextClickEvent = true;
+                expireIgnoreTimer = setTimeout(() => state.ignoreNextClickEvent = false, 1503);
+                lastStart && lastStart.preventDefault();
+                lastStart && lastStart.stopPropagation();
+                tf && tf.preventDefault();
+                tf && tf.stopPropagation();
+              }
               const {pageX,pageY,clientX,clientY} = touch1;
-              el.dispatchEvent(new CustomEvent('contextmenu', {detail:{pageX,pageY,clientX,clientY}}));
-              DEBUG.debugContextMenu && console.log(`Triggered`);
+              DEBUG.debugContextMenu && console.log({pageX,pageY,clientX,clientY});
+              el.dispatchEvent(new CustomEvent('contextmenu', {detail:{pageX, pageY, clientX, clientY}}));
             }
           }
         }
@@ -1390,6 +2134,8 @@
         function H(event) {
           // block if no tabs
 
+          //DEBUG.debugKeyEvents && event.type.startsWith('key') && console.info(`[H]: got key event: ${event.key} (${event.type.slice(3)})`, event);
+
           DEBUG.HFUNCTION && console.log(`H received`, event);
           if (state.tabs.length == 0) {
             if ( SessionlessEvents.has(event.type) ) {
@@ -1403,6 +2149,7 @@
           const tabKeyPressForBrowserUI = event.key == "Tab" && !event.vRetargeted;
           const touchEvent = event.type.startsWith('touch');
           const unnecessaryIfSyncValue = (
+            !(DEBUG.utilizeTempHackFixForIMENoKey && event.isHack) &&
             state.convertTypingEventsToSyncValueEvents && 
             CancelWhenSyncValue.has(event.type) &&
             EnsureCancelWhenSyncValue(event)
@@ -1420,7 +2167,11 @@
           } else if ( pointerEvent ) {
             state.DoesNotSupportPointerEvents = false;
           } else if ( syntheticNonTypingEventWrapper ) {
-            event.event.preventDefault && event.event.preventDefault();
+            try { 
+              event.event.preventDefault && event.event.preventDefault();
+            } catch(e) {
+              console.info(`Event must be passive.`, e);
+            }
           }
 
           const simulated = event.event && event.event.simulated;
@@ -1432,6 +2183,61 @@
             event.value = event.event.target.value;
             event.contextId = state.contextIdOfFocusedInput;
             event.data = "";
+            DEBUG.logTyping && console.log("Typing -> Sync Value : Event", event, event.event);
+            if ( DEBUG.utilizeTempHackFixForIMENoKey && state.viewState.hasNoKeys ) {
+              if ( event.value.length == 0 ) {
+                state.viewState.hasNoKeys = true;
+              } else {
+                setTimeout(async () => {
+                  H({
+                    isHack: true,
+                    type: "keydown",
+                    key: "Space"
+                  });
+                  state.pressKey({'keyCode': 32, 'code': 'Space', 'key': ' '});
+                  await sleep(150);
+                  H({
+                    isHack: true,
+                    type: "keyup",
+                    key: "Space"
+                  });
+                  await sleep(300);
+                  H({
+                    isHack: true,
+                    type: "keydown",
+                    key: "Backspace"
+                  });
+                  await sleep(175);
+                  H({
+                    isHack: true,
+                    type: "keyup",
+                    key: "Backspace"
+                  });
+                }, 170);
+                // Doesn't work to overcome input key event detection when using mobile IME
+                  /*
+                    queue.send({
+                      command: {
+                        name: "Input.dispatchKeyEvent",
+                        params: {
+                          type: 'char',
+                          text: event.value,
+                          //unmodifiedText: text,
+                          code: 229,
+                          key: "Unidentified",
+                          windowsVirtualKeyCode: 229,
+                          modifiers: 0,
+                        },
+                      }
+                    });
+                  */
+                // Doesn't work to overcome input key event detection when using mobile IME
+                  /*
+                    state.pressKey(event.event);
+                  */
+                state.viewState.hasNoKeys = false; 
+              }
+            }
           }
 
           const isThrottled = ThrottledEvents.has(event.type);
@@ -1441,7 +2247,7 @@
           if ( mouseWheel ) {
             transformedEvent.contextId = state.viewState.latestScrollContext;
           }
-          
+
           if ( (event.type.startsWith('key')) && (event.code === 229 || event.keyCode === 229) ) {
             showIMEUI();
           } 
@@ -1452,6 +2258,8 @@
           } else if ( isThrottled ) {
             DEBUG.HFUNCTION && console.log(`H Sending`, transformedEvent);
             queue.send(transformedEvent);
+            DEBUG.debugKeyEvents && event.type.startsWith('key') && console.info(`[H]: sent key event: ${event.key} (${event.type.slice(3)})`);
+            DEBUG.debugKeyEvents & event.type.startsWith('key') && console.log((new Error).stack);
           } else {
             if ( event.type == "keydown" && event.key == "Enter" ) {
               // Note
@@ -1473,9 +2281,11 @@
                   }, {scale: state.viewState.scale}, state.viewState.bounds);
                   DEBUG.HFUNCTION && console.log(`H Sending`, newEvent);
                   queue.send(newEvent);
+                  DEBUG.debugKeyEvents && console.info(`[H]: sent key event: ${event.key} (${event.type.slice(3)})`);
                   state.latestCommitData = state.latestData;
                   state.latestData = "";
                 } 
+                //DEBUG.debugKeyEvents && alert('enter');
               }
             } else if ( event.type == "keydown" && event.key == "Backspace" ) {
               state.backspaceFiring = true;
@@ -1511,12 +2321,52 @@
             }
             DEBUG.HFUNCTION && console.log(`H Sending`, transformedEvent);
             queue.send(transformedEvent);
+            //DEBUG.debugKeyEvents && console.log('Sent',{transformedEvent,event});
+            DEBUG.debugKeyEvents && event.type.startsWith('key') && console.info(`[H]: sent key event: ${event.key} (${event.type.slice(3)})`);
+            DEBUG.debugKeyEvents & event.type.startsWith('key') && console.log((new Error).stack);
           }
         }
 
         function dalert(...args) {
           return;
           setTimeout(() => alert(...args), 1000);
+        }
+
+        async function getBounds(el) {
+          el = el || (await untilTrue(() => !!state.viewState.canvasEl) && state.viewState.canvasEl);
+          if ( ! el ) {
+            //throw new TypeError(`sizeBrowserToBounds needs to be called with element as argument.`);
+            DEBUG.val && console.warn(new TypeError(`sizeBrowserToBounds needs to be called with element as argument.`));
+            return;
+          }
+          let {width, height} = el.getBoundingClientRect();
+          width = Math.round(width);
+          height = Math.round(height);
+          return {width, height};
+        }
+
+        async function untilSizeStabilizes(el, inRow = 3, maxChecks = 100) {
+          let count = 0;
+          let achieved = 0;
+          let {width,height} = await getBounds(el);
+          while(true) {
+            count++;
+            if ( count > maxChecks ) throw new Error(`Bounds kept changing`);
+            await sleep(100); 
+            const {width:newWidth, height: newHeight} = await getBounds(el);
+            if ( newWidth == width && newHeight == height ) {
+              achieved++;
+              if ( achieved >= inRow ) break;
+            } else {
+              achieved = 0;
+              width = newWidth;
+              height = newHeight;
+            }
+          }
+
+          DEBUG.showStableSizeOnResize && alert(`Size stabilized at: ${width} x ${height}`);
+
+          return true;
         }
 
         async function sizeBrowserToBounds(el, targetId, opts) {
@@ -1543,6 +2393,7 @@
             type: "window-bounds",
             width,
             height,
+            mobile,
             targetId: targetId || state.activeTarget,
             ...opts
           });
@@ -1556,7 +2407,7 @@
           });
           self.ViewportWidth = width;
           self.ViewportHeight = height;
-          return {width,height};
+          return {width,height,mobile};
         }
 
         function validOpts(obj, ...keys) {
@@ -1590,12 +2441,15 @@
           setState('bbpro', state);
         }
 
-        function sizeTab(opts) {
+        async function sizeTab(opts) {
           return sizeBrowserToBounds(state.viewState.canvasEl, null, opts);
         }
 
-        function asyncSizeBrowserToBounds(el, opts) {
-          setTimeout(() => (sizeBrowserToBounds(el, null, opts), indicateNoOpenTabs()), 0);
+        async function asyncSizeBrowserToBounds(el, opts) {
+          await sleep(40);
+          const vp = await sizeBrowserToBounds(el, null, opts); 
+          indicateNoOpenTabs();
+          return vp;
         }
 
         function emulateNavigator() {
@@ -1614,11 +2468,15 @@
 
         async function activateTab(click, tab, {
             notify: notify = true, 
-            forceFrame: forceFrame = false
+            forceFrame: forceFrame = false,
+            noResize: noResize = false,
           } = {}) {
-            DEBUG.activateDebug && console.log('activate called', click, tab, {notify, forceFrame});
+            DEBUG.activateDebug && console.log('activate called', click, tab, {notify, forceFrame}, new Error);
+            DEBUG.activateDebug && alert((new Error).stack);
 
-            sizeTab();
+            if ( ! noResize ) {
+              sizeTab();
+            }
 
             // don't activate if the click was a close click from our tab
             if ( click && click.currentTarget.querySelector('button.close') == click.target ) return;
@@ -1639,15 +2497,6 @@
             } else {
               tab = ourtab;
             }
-            DEBUG.val && console.log('Activating?', tab);
-
-            if ( state.activeTarget == tab.targetId ) {
-              if ( state.chromeUI ) { // otherwise there is no omniBoxInput
-                if ( state.viewState.omniBoxInput == state.viewState.lastActive ) {
-                  state.viewState.omniBoxInput?.focus();
-                }
-              }
-            }
 
             DEBUG.val && console.log('Activating', tab);
 
@@ -1661,17 +2510,20 @@
             }
 
             const {targetId} = tab;
+            let needsShot = false;
 
             // grab the last cached frame of the new active, 
             // and save this current tab's frame for when we swtich back to it
             const lastFrame = state.viewState.canvasEl?.toDataURL();
             LastFrames.set(state.activeTarget, lastFrame);
-            clearViewport();
             const nextFrame = LastFrames.get(targetId);
             if ( nextFrame ) {
               const imageEl = queue.getImageEl();
               imageEl.oldSrc = imageEl.src;
               imageEl.src = nextFrame;
+            } else {
+              clearViewport();
+              needsShot = true;
             }
 
             queue.send({
@@ -1695,21 +2547,39 @@
             state.activeTarget = targetId;
             state.active = activeTab();
 
+            canKeysInput();
+
             setState('bbpro', state);
+
+            if ( CONFIG.doAckBlast ) {
+              clearInterval(state.currentAckBlastInterval);
+              const startTime = Date.now();
+              state.currentAckBlastInterval = setInterval(() => {
+                if ( (Date.now() - startTime) > CONFIG.ACK_BLAST_LENGTH ) {
+                  clearInterval(state.currentAckBlastInterval);
+                } else {
+                  queue.sendAck();
+                }
+              }, 300);
+            }
+
+            if ( needsShot ) {
+              DEBUG.debugActivate && console.warn(`Needs shot`, state.active);
+            }
 
             const now = new Date;
             const delta = now - lastTime;
             if ( delta > 1000 ) {
               lastTime = now;
-              setTimeout(() => {
-                let el;
-                if ( click ) {
-                  el = click.target;
-                } else if ( ! notify ) {
-                  el = Array.from(Root.querySelectorAll('nav.targets li.tab-selector a'))
-                    .find(el => el.href.endsWith(tab.targetId));
-                }
-                el?.scrollIntoView({behavior:'smooth',inline:'center'});
+              setTimeout(async () => {
+                await untilTrueOrTimeout(() => !!document?.querySelector?.('bb-view')
+                  ?.shadowRoot?.querySelector?.('bb-tabs')
+                    ?.shadowRoot?.querySelector?.('bb-select-tab.active')
+                , 17).catch(e => console.warn('oh well could not find tab yet, must be some slowness'));
+                let el = document.querySelector('bb-view')
+                  .shadowRoot.querySelector('bb-tabs')
+                    .shadowRoot.querySelector('bb-select-tab.active');
+                el?.scrollIntoView?.({behavior:'smooth',inline:'center'});
               }, 500);
             }
 
@@ -1820,9 +2690,13 @@
               }
               // this ensures we activate the tab
               if ( state.tabs.length ) {
-                if ( state.tabs.length == 1 ) {
+                if ( state.tabs.length == 1 && !activeTarget) {
+                  DEBUG.activateDebug && console.log(`Activate to be called`);
+                  DEBUG.activateDebug && alert((new Error).stack);
                   setTimeout(() => activateTab(null, {hello:'onupdate.len1', targetId:state.tabs[0].targetId}, {forceFrame:true}), LONG_DELAY);
                 } else if( !activeTarget ) {
+                  DEBUG.activateDebug && console.log(`Activate to be called`);
+                  DEBUG.activateDebug && alert((new Error).stack);
                   setTimeout(() => activateTab(null, {hello:'onupdate.noactive', targetId:state.tabs[0].targetId}, {forceFrame:true}), LONG_DELAY);
                 } else {
                   // the reason we don't set timeout here is because if we did
@@ -1838,7 +2712,7 @@
               while(state.updateTabsTasks.length) {
                 const task = state.updateTabsTasks.shift();
                 try {
-                  task();
+                  await Promise.race([throwAfter(5000), task()]);
                 } catch(e) {
                   console.warn("State update tabs task failed", e, task);
                 }
@@ -1876,6 +2750,8 @@
         function canKeysInput() {
           if ( state.viewState.viewFrameEl ) return;
           setTimeout(() => {
+            DEBUG.debugKeysCanInput && console.log(`Sending canKeysInput`);
+            DEBUG.debugKeysCanInput && deviceIsMobile() && alert(`Sending canKeysInput`);
             queue.send({
               type: "canKeysInput",
               synthetic: true
@@ -1944,6 +2820,33 @@
       };
     }
 
+    export function magicAssign(target, ...sources) {
+      sources.forEach(src => {
+        Object.defineProperties(
+          target,
+          Object.getOwnPropertyNames(src).reduce((descriptors, key) => {
+            let originalDescriptor = Object.getOwnPropertyDescriptor(src, key);
+
+            // Rebind getters and setters to the target object
+            if (originalDescriptor.get || originalDescriptor.set) {
+              descriptors[key] = {
+                get: originalDescriptor.get ? originalDescriptor.get.bind(target) : undefined,
+                set: originalDescriptor.set ? originalDescriptor.set.bind(target) : undefined,
+                enumerable: originalDescriptor.enumerable,
+                configurable: originalDescriptor.configurable
+              };
+            } else {
+              descriptors[key] = originalDescriptor;
+            }
+
+            return descriptors;
+          }, {})
+        );
+      });
+
+      return target;
+    }
+
     function parseURLFlags(params) {
       const flags = new Map();
       for( const [flag, value] of params ) {
@@ -1966,6 +2869,10 @@
         }
       }
       return flags;
+    }
+
+    function logTyping(event) {
+      console.log(`[DEBUG TYPING] ${(' ' + event.type).padStart(25, '-')} `, event);
     }
 
   // patching 

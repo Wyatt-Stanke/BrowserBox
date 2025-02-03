@@ -1,19 +1,15 @@
+  /* entry point */
+  import fs from 'fs';
+  import path from 'path';
   import exitOnExpipe from 'exit-on-epipe';
   import express from 'express';
-  import zl from './zombie-lord/api.js';
+  import zl from './zombie-lord/index.js';
   import {MAX_FRAMES} from './zombie-lord/screenShots.js';
-  import {COMMAND_MAX_WAIT,DEBUG,GO_SECURE,sleep,throwAfter} from './common.js';
+  import {CONFIG, EXPEDITE, COMMAND_MAX_WAIT,DEBUG,GO_SECURE,sleep,throwAfter} from './common.js';
   import {start_ws_server} from './ws-server.js';
+  import {applicationCheck} from './hard/application.js';
 
   const BEGIN_AGAIN = 500;
-  const EXPEDITE = new Set([
-    "Page.navigate",
-    "Page.navigateToHistoryEntry",
-    "Runtime.evaluate",
-    "Emulation.setUserAgentOverride",
-    "Input.dispatchMouseEvent",
-  ]);
-
   import {
     chrome_port, app_port, cookie, 
     /*username,*/ token, start_mode
@@ -21,21 +17,31 @@
 
   const demoBlock = token == 'demotoken';
   let ws_started = false;
+  let lastDebugOrderId = -Infinity;
   let server;
+  let targetSaver;
+  let licenseValid;
   //let zombie_started = false;
 
   if ( GO_SECURE && start_mode == "signup" ) {
     const redirector = express();
-    redirector.get('*', (req,res) => {
+    redirector.get('/*path', (req,res) => {
       res.redirect('https://' + req.headers.host + req.url);
     });
     redirector.listen(80, () => DEBUG.val && console.log('listening on 80 for https redirect'));
   }
 
   try { 
-    process.title = "bbpro";
+    process.title = "browserbox";
   } catch(e) {
     console.info(`Could not set process title. Current title: ${process.title}`, e);
+  }
+  
+  try {
+    licenseValid = await applicationCheck();
+    console.log({licenseValid});
+  } catch(e) {
+    console.warn(`Application check error:`, e);
   }
 
   process.on('uncaughtException', err => {
@@ -56,6 +62,10 @@
     //begin();
   });
 
+  process.on('beforeExit', () => {
+    clearInterval(targetSaver);
+  });
+
   begin();
 
   async function begin() {
@@ -64,12 +74,16 @@
       try {
         ({port} = await zl.life.newZombie({port: chrome_port, /*username*/}));
         zl.act.setOptions({demoBlock});
+
       } catch(e) {
         console.warn("ZL start error", e);
         zl.life.kill(chrome_port);
         setTimeout(begin, BEGIN_AGAIN);
       }
-      if ( port !== chrome_port ) throw Error(`Port must match port allocated: p${port}, cp${chrome_port}`);
+      if ( port !== chrome_port ) {
+        zl.life.kill(port);
+        throw Error(`Port must match port allocated: app port ${port}, chrome port ${chrome_port}`);
+      }
       DEBUG.val && console.log({zombie:"gnawing at port ", port});
       await sleep(BEGIN_AGAIN);
     }
@@ -78,6 +92,9 @@
         app_port, chrome_port, cookie, token, 
       );
       ws_started = true;
+    }
+    if ( ! targetSaver ) {
+      targetSaver = setInterval(saveTargetCount, 13001);
     }
   }
 
@@ -126,6 +143,20 @@
             console.log(`Sending ${JSON.stringify(command)}...`);
           }
         }
+        if ( DEBUG.debugKeyEvents && (
+            command?.name?.startsWith?.("Input.dispatchKey") || command?.name?.startsWith?.("Input.insertText")
+        ) ) {
+          console.info(`[eventSendLoop]: sending ${command.params.key || command.params.text} (${command.params.type ? command.params.type.slice(3) : 'press -> insert'}) (batch size: ${events.length})`);
+          //console.log(JSON.stringify(command,null,2));
+        }
+        if ( DEBUG.debugCommandOrder ) {
+          if ( command.debugOrderId <= lastDebugOrderId ) {
+            console.info(`Command sequence disorder: about to emit ${command.debugOrderId}, but last was ${lastDebugOrderId}`);
+            console.log(command);
+          }
+          lastDebugOrderId = command.debugOrderId;
+          delete command.debugOrderId;
+        }
         const sendResult = await timedSend(command, chrome_port);
         DEBUG.debugSendResult && console.log(JSON.stringify({sendResult}));
         if ( sendResult ) {
@@ -148,7 +179,8 @@
           }
           if ( frameBuffer ) {
             Frames.push(...frameBuffer);
-            while(Frames.length > MAX_FRAMES) Frames.shift();
+            const mf = MAX_FRAMES();
+            while(Frames.length > mf) Frames.shift();
           }
           State.totalBandwidth = totalBandwidth;
         } else {
@@ -160,4 +192,10 @@
       }
     }
     DEBUG.metaDebug && DEBUG.val && console.log('after loop', {Meta});
+  }
+
+  // necessary to know if we closed browser with any tabs or not, so we know whether to open a 'home page' tag when we start again
+  function saveTargetCount() {
+    const targetCount = zl.act.getTargets(chrome_port).length;
+    fs.writeFileSync(path.resolve(CONFIG.baseDir, 'targetCount'), `${targetCount}`);
   }

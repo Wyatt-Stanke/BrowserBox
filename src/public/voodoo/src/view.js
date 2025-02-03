@@ -1,4 +1,4 @@
-import {iden,deviceIsMobile, throttle,DEBUG,elogit} from './common.js';
+import {CONFIG, iden, deviceIsMobile, throttle, DEBUG, elogit} from './common.js';
 import {cloneKeyEvent} from './constructor.js';
 import {s as R, c as X} from '../node_modules/bang.html/src/vv/vanillaview.js';
 import * as Subviews from './subviews/index.js';
@@ -9,11 +9,15 @@ export const subviews = Subviews;
 
 //const DEFAULT_URL = 'https://google.com';
 //const isIOS = navigator.platform && navigator.platform.match("iPhone|iPod|iPad");
-const USE_INPUT_MODE = false;
+const USE_INPUT_MODE = true;
 
 // for bang
-const audio_port = Number(location.port ? location.port : ( location.protocol == 'https' ? 443 : 80 ) ) - 2;
-export const audio_login_url = `${location.protocol}//${location.hostname}:${audio_port}/login`;
+const audio_port = Number(CONFIG.mainPort ? CONFIG.mainPort : ( location.protocol == 'https' ? 443 : 80 ) ) - 2;
+export const audio_login_url = CONFIG.isOnion ? 
+  `${location.protocol}//${localStorage.getItem(CONFIG.audioServiceFileName)}/login?token=${encodeURIComponent(globalThis._sessionToken())}` 
+  : 
+  `${location.protocol}//${location.hostname}:${audio_port}/login?token=${encodeURIComponent(globalThis._sessionToken())}` 
+;
 
 // MIGRATE
 export function component(state) {
@@ -41,7 +45,7 @@ export function component(state) {
   state.endTimer = endTimer;
 
   const toggleVirtualKeyboard = e => {
-    e.preventDefault();
+    e?.preventDefault?.();
     let el = viewState.shouldHaveFocus;
     if ( el ) {
       if ( el == viewState.keyinput ) {
@@ -81,36 +85,6 @@ export function component(state) {
   });
   
   bondTasks.unshift(el => state.viewState.voodooEl = el);
-  bondTasks.push(() => {
-    document.addEventListener('keydown', event => {
-      if ( !event.target.matches('body') || state.viewState.shouldHaveFocus ) return;
-      if ( event.code == "Space" ) {
-        state.H({
-          type: 'wheel',
-          target: state.viewState.canvasEl,
-          pageX: 0,
-          pageY: 0,
-          clientX: 0,
-          clientY: 0,
-          deltaMode: 2,
-          deltaX: 0, 
-          contextId: state.viewState.latestScrollContext,
-          deltaY: event.shiftKey ? -0.618 : 0.618
-        });
-        //event.preventDefault();
-      } else if ( event.key == "Tab" ) {
-        retargetTab(event);
-      } else if ( event.key == "Enter" ) {
-        H(cloneKeyEvent(event, true));
-      }
-    });
-    document.addEventListener('keyup', event => {
-      if ( !event.target.matches('body') || state.viewState.shouldHaveFocus ) return;
-      if ( event.key == "Enter" ) {
-        H(cloneKeyEvent(event, true));
-      }
-    });
-  });
   bondTasks.push(() => self._voodoo_resizeAndReport());
 
   return;
@@ -119,13 +93,13 @@ export function component(state) {
     return location.pathname == "/bundle.html";
   }
 
-  function focusKeyinput(type = 'text', inputmode = 'text', value = '') {
+  function focusKeyinput(type, inputmode, value = '') {
     const {viewState} = state;
-    viewState.keyinput.type = type;
+    viewState.keyinput.type = type || viewState.keyinput.type || 'text';
     if ( USE_INPUT_MODE ) {
-      viewState.keyinput.inputmode = inputmode;
+      viewState.keyinput.inputmode = inputmode || 'text';
     }
-    viewState.keyinput.value = value;
+    viewState.keyinput.value = value || viewState.keyinput.value;
     if ( document.deepActiveElement != viewState.keyinput ) {
       viewState.keyinput.focus({preventScroll:true});
     }
@@ -136,6 +110,7 @@ export function component(state) {
     const {viewState} = state;
     if ( document.deepActiveElement == viewState.keyinput )
       viewState.keyinput.blur();
+    viewState.keyinput.value = '';
     viewState.shouldHaveFocus = null;
   }
 
@@ -155,6 +130,7 @@ export function component(state) {
     const {viewState} = state;
     if ( document.deepActiveElement == viewState.textarea ) 
       viewState.textarea.blur();
+    viewState.textarea.value = '';
     viewState.shouldHaveFocus = null;
   }
 }

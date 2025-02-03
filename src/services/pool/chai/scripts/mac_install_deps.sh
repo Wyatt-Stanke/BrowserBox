@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 export HOMEBREW_NO_AUTO_UPDATE=1
 brew update
@@ -11,4 +11,5 @@ brew install mactex
 brew install libreoffice
 brew install pandoc
 brew install coreutils
+brew install librsvg
 

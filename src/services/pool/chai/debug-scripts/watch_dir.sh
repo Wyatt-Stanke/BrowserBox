@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Check if the directory is provided
 if [ -z "$1" ]; then
@@ -15,7 +15,7 @@ fi
 # Check if inotify-tools is installed
 if ! command -v inotifywait &> /dev/null; then
   echo "Error: inotifywait could not be found. Attempting to install..."
-  sudo apt install inotify-tools
+  sudo $APT install inotify-tools
   if ! command -v inotifywait &> /dev/null; then
     echo "Error: failed to install inotify-tools. Please install manually."
     exit 1

@@ -1,5 +1,5 @@
 class BBContextMenu extends Base {
-  static CLOSE_DELAY = 222;
+  static CLOSE_DELAY = 1222;
 
   static SHORT_CUT = 'Ctrl+Shift+J';
 
@@ -65,8 +65,8 @@ class BBContextMenu extends Base {
           func: this.paste
         },
         {
-          hr: true,
           title: 'Reload',
+          hr: true,
           shortCut: this.constructor.SHORT_CUT,
           func: this.reload
         },
@@ -74,11 +74,6 @@ class BBContextMenu extends Base {
           title: 'Clear History',
           shortCut: this.constructor.SHORT_CUT,
           func: this.clearHistoryAndCacheLeaveCookies,
-        },
-        {
-          title: 'Wipe All Data',
-          shortCut: this.constructor.SHORT_CUT,
-          func: this.clearBrowsingData,
         },
         {
           title: 'Inspect in DevTools',
@@ -129,54 +124,97 @@ class BBContextMenu extends Base {
 
       DEBUG.debugInspect && console.log(`Opening DevTools window to inspect tab ${currentTab}`, state.active);
 
-      const devtoolsWindow = window.open("about:blank");
+      let devtoolsWindow;
+      if ( state.CONFIG.ensureDevToolsOpensInNewTab || !state.CONFIG.openServicesInCloudTabs ) {
+        devtoolsWindow = window.open("about:blank");
+      }
+      state.emulateActive(currentTab);
 
-      const url = new URL(location);
+      const url = state.CONFIG.isOnion ? new URL(
+          `${location.protocol}//${localStorage.getItem(state.CONFIG.devtoolsServiceFileName)}`
+        ) 
+        : 
+        new URL(location)
+      ;
 
-      url.port = parseInt(location.port) + 1;
+      if ( state.CONFIG.isDNSFacade ) {
+        const port = state.CONFIG.mainPort + 1;
+        const subs = url.hostname.split('.');
+        subs.shift();
+        subs.unshift(`p${port}`);
+        url.hostname = subs.join('.');
+        console.log({url});
+      } else {
+        url.port = state.CONFIG.isOnion ? 443 : (parseInt(state.CONFIG.mainPort) + 1);
+      }
 
       url.pathname = "login";
-      const params = new URLSearchParams();
+      const params = url.searchParams;
       params.set('token', state.sessionToken);
-      url.search = params;
 
       DEBUG.debugInspect && console.log("Login url", url.href);
 
-      await fetch(url, {mode: 'no-cors', credentials: 'include'});
+      const useCookies = state.useCookies;
+      DEBUG.debugInspect && alert('use cookie?' + useCookies);
+      DEBUG.debugInspect && console.log(state.CONFIG.mainPort, state.CONFIG)
 
-      url.pathname = `/devtools/inspector.html`
-      const inspectParams = new URLSearchParams();
-      inspectParams.set(
-        location.protocol.endsWith('https:') ? 'wss' : 'ws', 
-        `${url.host}/devtools/page/${currentTab}`
-      );
-      inspectParams.set('remoteFrontend', 'true');
-      url.search = inspectParams;
-
-      DEBUG.debugInspect && console.log("Inspect url", url.href);
-
-      devtoolsWindow.location  = url;
-    }
-
-    close(_, delay = true) {
-      const state = this.state;
-      const {_top} = this.state;
-      if ( delay ) {
-        setTimeout(() => {
-          if ( _top.viewState.contextMenu ) {
-            _top.viewState.contextMenu = null;
-            _top.contextMenuActive = false;
-            _top.contextMenuEvent = null;
-          }
-        }, this.constructor.CLOSE_DELAY);
-      } else {
-        if ( _top.viewState.contextMenu ) {
-          _top.viewState.contextMenu = null;
-          _top.contextMenuActive = false;
-          _top.contextMenuEvent = null;
+      // we don't use cookie auth with Tor as Tor browser will block this "3rd-party request"
+      if ( useCookies ) {
+        try {
+          await uberFetch(url, {mode: 'no-cors', credentials: 'include'});
+        } catch(e) {
+          console.warn(`Issue when attempting to login via token for cookie to devtools service`);
         }
       }
-      this.state = state;
+
+      const dtUrl = `${url.host}/devtools/page/${currentTab}`;
+      DEBUG.debugDevTools && console.log({dtUrl});
+      params.set(
+        location.protocol.endsWith('https:') ? 'wss' : 'ws', 
+        dtUrl
+      );
+      params.set('remoteFrontend', 'true');
+      if ( !useCookies ) {
+        const locationUrl = new URL(url);
+        locationUrl.pathname = `/devtools/inspector.html`
+        const nextUri = locationUrl.href;
+
+        url.pathname = '/login';
+        url.searchParams.set('token', localStorage.getItem(state.CONFIG.sessionTokenFileName));
+        url.searchParams.set('nextUri', nextUri);
+
+        DEBUG.debugInspect && console.log("Inspect url", url.href);
+
+        DEBUG.debugInspect && alert('Will set url to: ' + url);
+        if ( !state.CONFIG.ensureDevToolsOpensInNewTab && state.CONFIG.openServicesInCloudTabs ) {
+          state.createTab(click, url);
+          setTimeout(() => state.runUpdateTabs(), 0);
+        } else {
+          devtoolsWindow.location = url;
+        }
+      } else {
+        url.pathname = `/devtools/inspector.html`
+
+        DEBUG.debugInspect && console.log("Inspect url", url.href);
+
+        DEBUG.debugInspect && alert('Will set url to: ' + url);
+        if ( !state.CONFIG.ensureDevToolsOpensInNewTab && state.CONFIG.openServicesInCloudTabs ) {
+          state.createTab(click, url);
+          setTimeout(() => state.runUpdateTabs(), 0);
+        } else {
+          devtoolsWindow.location  = url;
+        }
+      }
+    }
+
+    close(_) {
+      DEBUG.debugContextMenu && console.log((new Error(`Tracking close event`)).stack);
+      const _top = _ ? _ : this.state._top;
+      if ( _top.viewState.contextMenu ) {
+        _top.viewState.contextMenu = null;
+        _top.contextMenuActive = false;
+        //_top.contextMenuEvent = null;
+      }
       setState('bbpro', _top);
     }
 
@@ -193,19 +231,21 @@ class BBContextMenu extends Base {
       DEBUG.debugCopyPaste && console.log({clientX,clientY});
       const target = state.viewState.canvasEl;
       const {H} = state;
-      this.close(state);
       state.elementInfoContinuation = ({innerText, noSuchElement}) => {
-        if ( ! noSuchElement ) {
-          state.elementInfoContinuation = null;
-          state.viewState.modalComponent.openModal({modal:{
-            type:'copy', 
-            highlight: true, 
-            message: innerText, 
-            title: `Text from Page`
-          }}, state);
+        if ( noSuchElement ) {
+          DEBUG.debugCopyPaste && console.log(`Got no such element so not nuking elementInfoContinuation`);
+          return;
         }
+        state.elementInfoContinuation = null;
+        state.viewState.modalComponent.openModal({modal:{
+          type:'copy', 
+          highlight: true, 
+          message: innerText, 
+          title: `Text from Page`
+        }}, state);
       };
-      DEBUG.debugCopyPaste && console.log({clientX,clientY});
+      this.close(state);
+      DEBUG.debugCopyPaste && console.log('setup elementInfoContinuation', {clientX,clientY}, state.elementInfoContinuation);
       H({
         type: 'getElementInfo',
         synthetic: true,
@@ -215,10 +255,10 @@ class BBContextMenu extends Base {
           clientX, clientY
         }
       });
+      DEBUG.debugCopyPaste && console.log('sending request for element info to remote');
       setTimeout(() => {
         state.checkResults();
       }, 300);
-      DEBUG.debugCopyPaste && console.log({clientX,clientY});
     }
 
     copyLink(click) {
@@ -311,11 +351,14 @@ class BBContextMenu extends Base {
       state = this.state._top;
       const contextClick = state.contextMenuEvent;
       const target = state.viewState.canvasEl;
+      DEBUG.debugTabs && console.log({contextClick, target});
       let pageX, pageY, clientX, clientY;
       if ( contextClick?.detail?.pageX ) {
         ({pageX,pageY,clientX,clientY} = contextClick.detail);
-      } else {
+      } else if ( contextClick ) {
         ({pageX,pageY,clientX,clientY} = contextClick);
+      } else {
+        console.warn(`NO data for context menu event`);
       }
       const {H} = state;
       // we need to get the URL of the target link 
@@ -393,18 +436,16 @@ class BBContextMenu extends Base {
 
     clearHistoryAndCacheLeaveCookies(click) {
       state = this.state._top;
-      const doIt = confirm("You'll stay signed in to most sites, but wipe browsing history and cached files. Are you sure?");
+      state.wipeIsInProgress = true;
+      globalThis.wipeIsInProgress = true;
+      const doIt = confirm("You'll stay signed in to most sites, but your browsing history and caches will be wiped. You cannot undo this action.\nIf you proceed, your application will reload in 5 seconds.\n\nAre you sure you want to clear all history and caches?");
       if ( doIt ) {
         const {H} = state;
         H({
           synthetic: true,
-          type: "clearAllPageHistory"
+          type: "clearCacheAndHistory"
         });
-        H({
-          synthetic: true,
-          type: "clearCache"
-        });
-        alert("Cleared all caches and history.");
+        setTimeout(() => location.reload(), 5000);
       }
       this.close(state);
     }
